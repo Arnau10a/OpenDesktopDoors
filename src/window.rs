@@ -1,4 +1,5 @@
 use crate::config::{PortalConfig, PortalKind, VirtualItem};
+use crate::desktop_pin::desktop_insert_after;
 use crate::dnd::{copy_or_move_into_folder, start_file_drag, PortalDropTarget};
 use crate::fs_watch::FolderWatcher;
 use crate::messages::{
@@ -20,7 +21,6 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
     DWMWCP_ROUND,
 };
-use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
 use windows::Win32::System::Com::CLSCTX_INPROC_SERVER;
 use windows::Win32::System::Ole::{IDropTarget, RegisterDragDrop, RevokeDragDrop};
 use windows::Win32::UI::Controls::MARGINS;
@@ -35,13 +35,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW,
     PostMessageW, RegisterClassExW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TrackPopupMenu, CS_DBLCLKS, GWLP_USERDATA, HWND_BOTTOM, HWND_TOPMOST, IDC_ARROW, IDC_SIZENWSE,
-    MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD,
-    TPM_TOPALIGN, WINDOWPOS, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_TIMER, WM_WINDOWPOSCHANGING, WNDCLASSEXW,
-    WS_CLIPCHILDREN, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
+    TrackPopupMenu, CS_DBLCLKS, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, IDC_SIZENWSE, MF_CHECKED,
+    MF_SEPARATOR, MF_STRING, MF_UNCHECKED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN,
+    WINDOWPOS, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_SIZE, WM_TIMER, WM_WINDOWPOSCHANGING, WNDCLASSEXW, WS_CLIPCHILDREN, WS_EX_NOACTIVATE,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -206,11 +206,13 @@ impl PortalWindow {
 
             // Win32/DWM calls happen with NO RefCell borrow held to avoid re-entrancy panics.
             setup_dwm_attributes(hwnd);
-            apply_window_region(hwnd, pw as i32, ph as i32, dpi, radius);
 
             {
                 let mut s = state.borrow_mut();
-                s.renderer = PortalRenderer::new(hwnd, pw, ph, dpi, radius).ok();
+                match PortalRenderer::new(hwnd, pw, ph, dpi, radius) {
+                    Ok(r) => s.renderer = Some(r),
+                    Err(err) => log_diag(&format!("PortalRenderer::new failed: {err:?}")),
+                }
                 s.restart_watcher();
                 s.register_dnd();
             }
@@ -370,7 +372,7 @@ pub fn apply_z_order_hwnd(hwnd: HWND) {
         let insert_after = if is_bring_to_front() {
             HWND_TOPMOST
         } else {
-            HWND_BOTTOM
+            desktop_insert_after(hwnd)
         };
         let _ = SetWindowPos(
             hwnd,
@@ -382,6 +384,21 @@ pub fn apply_z_order_hwnd(hwnd: HWND) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+}
+
+fn log_diag(msg: &str) {
+    let dir = crate::config::config_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let log_path = dir.join("runtime.log");
+    let line = format!("{msg}\n");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        use std::io::Write;
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
@@ -414,15 +431,6 @@ unsafe fn setup_dwm_attributes(hwnd: HWND) {
         cyBottomHeight: -1,
     };
     let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
-}
-
-unsafe fn apply_window_region(hwnd: HWND, pw: i32, ph: i32, dpi: f32, corner_radius: f32) {
-    let radius_px = (corner_radius * (dpi / 96.0)).round() as i32;
-    let diameter = (radius_px * 2).min(pw).min(ph).max(2);
-    let rgn = CreateRoundRectRgn(0, 0, pw + 1, ph + 1, diameter, diameter);
-    if !rgn.is_invalid() {
-        let _ = SetWindowRgn(hwnd, Some(rgn), false);
-    }
 }
 
 fn shell_open_path(owner: HWND, path: &std::path::Path) {
@@ -485,7 +493,7 @@ unsafe extern "system" fn portal_wnd_proc(
         wp.hwndInsertAfter = if is_bring_to_front() {
             HWND_TOPMOST
         } else {
-            HWND_BOTTOM
+            desktop_insert_after(hwnd)
         };
         return LRESULT(0);
     }
@@ -514,7 +522,6 @@ unsafe extern "system" fn portal_wnd_proc(
                 let p = rc_clone.borrow();
                 (p.dpi, p.config.theme.corner_radius)
             };
-            apply_window_region(hwnd, pw as i32, ph as i32, dpi, radius);
             if let Ok(mut p) = rc_clone.try_borrow_mut() {
                 if let Some(renderer) = &mut p.renderer {
                     let _ = renderer.resize(pw, ph, dpi, radius);

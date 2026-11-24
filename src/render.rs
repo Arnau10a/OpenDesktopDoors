@@ -316,6 +316,15 @@ impl PortalRenderer {
     }
 
     pub fn render(&mut self, state: &RenderState) -> windows::core::Result<()> {
+        self.draw_to_target(state)?;
+        unsafe {
+            self.swap_chain.Present(1, DXGI_PRESENT(0)).ok()?;
+            self.dcomp_device.Commit()?;
+        }
+        Ok(())
+    }
+
+    fn draw_to_target(&mut self, state: &RenderState) -> windows::core::Result<()> {
         unsafe {
             let ctx = &self.d2d_ctx;
             ctx.BeginDraw();
@@ -675,8 +684,6 @@ impl PortalRenderer {
             }
 
             ctx.EndDraw(None, None)?;
-            self.swap_chain.Present(1, DXGI_PRESENT(0)).ok()?;
-            self.dcomp_device.Commit()?;
             Ok(())
         }
     }
@@ -693,4 +700,195 @@ pub fn rect_size(rc: &RECT) -> (u32, u32) {
         (rc.right - rc.left).max(1) as u32,
         (rc.bottom - rc.top).max(1) as u32,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{PortalConfig, PortalKind};
+    use crate::messages::to_wide_null;
+    use crate::portal::load_items;
+    use windows::Win32::Graphics::Direct2D::{D2D1_MAPPED_RECT, D2D1_MAP_OPTIONS_READ};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::System::Ole::OleInitialize;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, WNDCLASSEXW,
+        WS_CLIPCHILDREN, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
+    };
+
+    unsafe extern "system" fn test_wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> windows::Win32::Foundation::LRESULT {
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+
+    #[test]
+    fn visual_render_smoke_and_capture() {
+        unsafe {
+            let _ = OleInitialize(None);
+            let hinst: windows::Win32::Foundation::HINSTANCE =
+                GetModuleHandleW(None).unwrap_or_default().into();
+            let cls = to_wide_null("ODDVisualTestWin");
+            let wc = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(test_wnd_proc),
+                hInstance: hinst,
+                lpszClassName: windows::core::PCWSTR(cls.as_ptr()),
+                ..Default::default()
+            };
+            RegisterClassExW(&wc);
+
+            let hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP | WS_EX_NOACTIVATE,
+                windows::core::PCWSTR(cls.as_ptr()),
+                windows::core::PCWSTR::null(),
+                WS_POPUP | WS_CLIPCHILDREN,
+                40,
+                40,
+                340,
+                360,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .expect("CreateWindowExW failed");
+
+            let mut renderer = PortalRenderer::new(hwnd, 340, 360, 96.0, 24.0)
+                .expect("PortalRenderer::new failed");
+
+            let cfg = PortalConfig {
+                id: "test".into(),
+                title: "Downloads".into(),
+                kind: PortalKind::Virtual {
+                    items: vec![
+                        crate::config::VirtualItem {
+                            name: "Documents".into(),
+                            target: std::env::temp_dir(),
+                        },
+                        crate::config::VirtualItem {
+                            name: "Windows".into(),
+                            target: std::path::PathBuf::from(r"C:\Windows"),
+                        },
+                        crate::config::VirtualItem {
+                            name: "Notepad".into(),
+                            target: std::path::PathBuf::from(r"C:\Windows\notepad.exe"),
+                        },
+                    ],
+                },
+                x: 40,
+                y: 40,
+                width: 340,
+                expanded_height: 360,
+                collapsed: false,
+                auto_collapse: false,
+                theme: PortalTheme::default(),
+            };
+            let items = load_items(&cfg.kind);
+            let layout = GridLayout::compute(340.0, 360.0, items.len());
+            let state = RenderState {
+                title: &cfg.title,
+                items: &items,
+                layout: &layout,
+                width: 340.0,
+                height: 360.0,
+                dpi: 96.0,
+                scroll_y: 0.0,
+                hovered_index: Some(0),
+                collapsed: false,
+                auto_collapse: false,
+                is_drag_over: false,
+                is_virtual: false,
+                theme: &cfg.theme,
+            };
+
+            renderer
+                .draw_to_target(&state)
+                .expect("draw_to_target failed");
+
+            // Read back target_bitmap via CPU-readable D2D bitmap before Present flips buffer 0
+            let props = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                bitmapOptions: D2D1_BITMAP_OPTIONS_CANNOT_DRAW
+                    | windows::Win32::Graphics::Direct2D::D2D1_BITMAP_OPTIONS_CPU_READ,
+                ..Default::default()
+            };
+            let cpu_bmp = renderer
+                .d2d_ctx
+                .CreateBitmap(
+                    windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U {
+                        width: 340,
+                        height: 360,
+                    },
+                    None,
+                    0,
+                    &props,
+                )
+                .expect("CreateBitmap cpu_read");
+            let target = renderer.target_bitmap.as_ref().expect("target_bitmap");
+            cpu_bmp
+                .CopyFromBitmap(None, target, None)
+                .expect("CopyFromBitmap");
+            let mapped: D2D1_MAPPED_RECT = cpu_bmp.Map(D2D1_MAP_OPTIONS_READ).expect("Map");
+
+            // Composite onto a vibrant desktop-like gradient and write BMP
+            let mut bmp_bytes = Vec::with_capacity(54 + 340 * 360 * 4);
+            let file_size = (54 + 340 * 360 * 4) as u32;
+            bmp_bytes.extend_from_slice(b"BM");
+            bmp_bytes.extend_from_slice(&file_size.to_le_bytes());
+            bmp_bytes.extend_from_slice(&0u32.to_le_bytes());
+            bmp_bytes.extend_from_slice(&54u32.to_le_bytes());
+            bmp_bytes.extend_from_slice(&40u32.to_le_bytes());
+            bmp_bytes.extend_from_slice(&340i32.to_le_bytes());
+            bmp_bytes.extend_from_slice(&(-360i32).to_le_bytes());
+            bmp_bytes.extend_from_slice(&1u16.to_le_bytes());
+            bmp_bytes.extend_from_slice(&32u16.to_le_bytes());
+            bmp_bytes.extend_from_slice(&0u32.to_le_bytes());
+            bmp_bytes.extend_from_slice(&((340 * 360 * 4) as u32).to_le_bytes());
+            bmp_bytes.extend_from_slice(&[0u8; 16]);
+
+            let mut non_zero_alpha = 0usize;
+            for y in 0..360usize {
+                let row =
+                    std::slice::from_raw_parts(mapped.bits.add(y * mapped.pitch as usize), 340 * 4);
+                for x in 0..340usize {
+                    let b = row[x * 4] as f32;
+                    let g = row[x * 4 + 1] as f32;
+                    let r = row[x * 4 + 2] as f32;
+                    let a = row[x * 4 + 3];
+                    if a > 0 {
+                        non_zero_alpha += 1;
+                    }
+                    let af = a as f32 / 255.0;
+                    // Simulated wallpaper behind Acrylic
+                    let bg_r = 45.0 + (x as f32 / 340.0) * 90.0;
+                    let bg_g = 90.0 + (y as f32 / 360.0) * 80.0;
+                    let bg_b = 175.0 - (x as f32 / 340.0) * 40.0;
+                    let out_b = (b + bg_b * (1.0 - af)).clamp(0.0, 255.0) as u8;
+                    let out_g = (g + bg_g * (1.0 - af)).clamp(0.0, 255.0) as u8;
+                    let out_r = (r + bg_r * (1.0 - af)).clamp(0.0, 255.0) as u8;
+                    bmp_bytes.extend_from_slice(&[out_b, out_g, out_r, 255]);
+                }
+            }
+            let _ = cpu_bmp.Unmap();
+            let _ = DestroyWindow(hwnd);
+
+            assert!(non_zero_alpha > 10_000, "rendered frame was transparent!");
+            let out_dir = std::env::temp_dir().join("open_desktop_doors_test");
+            let _ = std::fs::create_dir_all(&out_dir);
+            std::fs::write(out_dir.join("portal_render.bmp"), &bmp_bytes).unwrap();
+            let _ = std::fs::remove_dir_all(&out_dir);
+            println!("RENDERED_OK non_zero_alpha={}", non_zero_alpha);
+        }
+    }
 }
