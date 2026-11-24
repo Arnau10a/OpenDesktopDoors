@@ -17,7 +17,7 @@ mod startup;
 mod tray;
 mod window;
 
-use config::{AppConfig, PortalConfig, PortalKind, PortalTheme, SortBy};
+use config::{AppConfig, LayoutStyle, PortalConfig, PortalKind, PortalTheme, SortBy};
 use covers::{spawn_missing_cover_fetcher, PendingCovers};
 use desktop_pin::DesktopPinGuard;
 use hotkey::{GlobalHotkey, HOTKEY_TOGGLE_FRONT_ID};
@@ -32,8 +32,8 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use tray::{
     TrayIcon, CMD_EXIT, CMD_NEW_CUSTOM_PORTAL, CMD_NEW_FAVORITES_PORTAL, CMD_NEW_INSTALLED_PORTAL,
-    CMD_NEW_RECENT_PORTAL, CMD_NEW_STEAM_PORTAL, CMD_OPEN_CONFIG_DIR, CMD_RESCAN_LIBRARY,
-    CMD_TOGGLE_FRONT, CMD_TOGGLE_STARTUP,
+    CMD_NEW_RECENT_PORTAL, CMD_NEW_STATS_PORTAL, CMD_NEW_STEAM_PORTAL, CMD_OPEN_CONFIG_DIR,
+    CMD_RESCAN_LIBRARY, CMD_TOGGLE_FRONT, CMD_TOGGLE_STARTUP,
 };
 use window::{apply_z_order_hwnd, is_bring_to_front, set_bring_to_front, PortalWindow};
 use windows::core::PCWSTR;
@@ -97,6 +97,7 @@ impl AppState {
             title: title.to_string(),
             kind,
             sort_by,
+            layout_style: LayoutStyle::Cards,
             x: 64 + offset,
             y: 64 + offset,
             width: 480,
@@ -382,6 +383,13 @@ unsafe extern "system" fn controller_wnd_proc(
                                 game_ids: Vec::new(),
                             },
                             SortBy::Name,
+                        );
+                    }
+                    Some(CMD_NEW_STATS_PORTAL) => {
+                        rc_clone.borrow_mut().spawn_portal(
+                            "Tus Estadísticas",
+                            PortalKind::Stats,
+                            SortBy::Playtime,
                         );
                     }
                     Some(CMD_RESCAN_LIBRARY) => {

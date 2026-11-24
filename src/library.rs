@@ -271,6 +271,20 @@ impl GameLibrary {
                 .filter(|g| g.is_installed)
                 .cloned()
                 .collect(),
+            PortalKind::Stats => {
+                let mut all: Vec<GameEntry> = self
+                    .games
+                    .iter()
+                    .filter(|g| g.playtime_secs > 0)
+                    .cloned()
+                    .collect();
+                if all.is_empty() {
+                    all = self.games.iter().take(3).cloned().collect();
+                }
+                all.sort_by_key(|a| std::cmp::Reverse(a.playtime_secs));
+                all.truncate(3);
+                return all;
+            }
             PortalKind::Launcher { name } => self
                 .games
                 .iter()
@@ -310,6 +324,10 @@ impl GameLibrary {
         }
 
         filtered
+    }
+
+    pub fn total_playtime_secs(&self) -> u64 {
+        self.games.iter().map(|g| g.playtime_secs).sum()
     }
 
     pub fn toggle_favorite(&mut self, game_id: &str) -> bool {

@@ -1,9 +1,9 @@
-use crate::config::PortalTheme;
+use crate::config::{LayoutStyle, PortalTheme};
 use crate::covers::CoverCache;
 use crate::icons::IconCache;
 use crate::library::{format_last_played, format_playtime, GameEntry};
 use crate::messages::to_wide_null;
-use crate::portal::{GameGridLayout, HitTarget, COVER_HEIGHT, HEADER_HEIGHT};
+use crate::portal::{GameGridLayout, HitTarget, RectF, HEADER_HEIGHT};
 use windows::core::Interface;
 use windows::Win32::Foundation::{HMODULE, HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
@@ -13,9 +13,10 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1,
     ID2D1RenderTarget, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_BRUSH_PROPERTIES1,
     D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
-    D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_EXTEND_MODE_CLAMP,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
-    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_ROUNDED_RECT, D2D1_UNIT_MODE_DIPS,
+    D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE,
+    D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
+    D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
+    D2D1_ROUNDED_RECT, D2D1_UNIT_MODE_DIPS,
 };
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_11_0,
@@ -48,6 +49,7 @@ use windows_numerics::{Matrix3x2, Vector2};
 pub struct RenderState<'a> {
     pub title: &'a str,
     pub games: &'a [GameEntry],
+    pub total_library_secs: u64,
     pub layout: &'a GameGridLayout,
     pub width: f32,
     pub height: f32,
@@ -80,6 +82,7 @@ pub struct PortalRenderer {
     pill_fmt: IDWriteTextFormat,
     hero_title_fmt: IDWriteTextFormat,
     play_btn_fmt: IDWriteTextFormat,
+    stats_big_fmt: IDWriteTextFormat,
     empty_fmt: IDWriteTextFormat,
     cover_cache: CoverCache,
     icon_cache: IconCache,
@@ -196,32 +199,38 @@ impl PortalRenderer {
                 DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
             )?;
             let card_title_fmt = make_fmt(
-                DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                11.5,
+                DWRITE_FONT_WEIGHT_BOLD,
+                12.5,
                 DWRITE_TEXT_ALIGNMENT_LEADING,
                 DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
             )?;
             let card_meta_fmt = make_fmt(
                 DWRITE_FONT_WEIGHT_MEDIUM,
-                10.0,
+                10.5,
                 DWRITE_TEXT_ALIGNMENT_LEADING,
                 DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
             )?;
             let pill_fmt = make_fmt(
                 DWRITE_FONT_WEIGHT_BOLD,
-                9.5,
+                10.0,
                 DWRITE_TEXT_ALIGNMENT_CENTER,
                 DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
             )?;
             let hero_title_fmt = make_fmt(
                 DWRITE_FONT_WEIGHT_BOLD,
-                16.5,
+                18.5,
                 DWRITE_TEXT_ALIGNMENT_LEADING,
                 DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
             )?;
             let play_btn_fmt = make_fmt(
                 DWRITE_FONT_WEIGHT_BOLD,
-                12.5,
+                12.0,
+                DWRITE_TEXT_ALIGNMENT_CENTER,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+            )?;
+            let stats_big_fmt = make_fmt(
+                DWRITE_FONT_WEIGHT_BOLD,
+                20.0,
                 DWRITE_TEXT_ALIGNMENT_CENTER,
                 DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
             )?;
@@ -251,6 +260,7 @@ impl PortalRenderer {
                 pill_fmt,
                 hero_title_fmt,
                 play_btn_fmt,
+                stats_big_fmt,
                 empty_fmt,
                 cover_cache: CoverCache::new(),
                 icon_cache: IconCache::new(),
@@ -379,105 +389,109 @@ impl PortalRenderer {
                 radiusY: r,
             };
 
-            // 1. Playnite deep slate-navy glass tint over Win11 DWM Acrylic
-            let glass_brush = ctx.CreateSolidColorBrush(
-                &D2D1_COLOR_F {
-                    r: state.theme.tint_r,
-                    g: state.theme.tint_g,
-                    b: state.theme.tint_b,
-                    a: state.theme.tint_a,
-                },
-                None,
-            )?;
-            ctx.FillRoundedRectangle(&full_rounded, &glass_brush);
-
-            // 2. Playnite header gradient (#2C3A67 subtle top wash)
-            let header_rect = D2D_RECT_F {
-                left: 0.0,
-                top: 0.0,
-                right: state.width,
-                bottom: HEADER_HEIGHT.min(state.height),
-            };
-            let header_brush = ctx.CreateSolidColorBrush(
-                &D2D1_COLOR_F {
-                    r: 0.173,
-                    g: 0.227,
-                    b: 0.404,
-                    a: 0.34,
-                },
-                None,
-            )?;
-            ctx.FillRectangle(&header_rect, &header_brush);
-
-            if state.height > HEADER_HEIGHT + 6.0 {
-                let div_brush = ctx.CreateSolidColorBrush(
-                    &D2D1_COLOR_F {
-                        r: 1.0,
-                        g: 1.0,
-                        b: 1.0,
-                        a: 0.10,
+            // 1. Warm Burgundy-Mahogany gradient base (#220F12 -> #32181E)
+            let bg_stops = [
+                D2D1_GRADIENT_STOP {
+                    position: 0.0,
+                    color: D2D1_COLOR_F {
+                        r: state.theme.tint_r * 0.92,
+                        g: state.theme.tint_g * 0.90,
+                        b: state.theme.tint_b * 0.92,
+                        a: state.theme.tint_a,
                     },
-                    None,
-                )?;
-                ctx.DrawLine(
-                    Vector2 {
-                        X: 0.0,
-                        Y: HEADER_HEIGHT,
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 1.0,
+                    color: D2D1_COLOR_F {
+                        r: (state.theme.tint_r * 1.32).min(0.4),
+                        g: (state.theme.tint_g * 1.25).min(0.25),
+                        b: (state.theme.tint_b * 1.30).min(0.3),
+                        a: state.theme.tint_a,
                     },
-                    Vector2 {
+                },
+            ];
+            let bg_col = ID2D1RenderTarget::CreateGradientStopCollection(
+                ctx,
+                &bg_stops,
+                D2D1_GAMMA_2_2,
+                D2D1_EXTEND_MODE_CLAMP,
+            )?;
+            let bg_brush = ctx.CreateLinearGradientBrush(
+                &D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                    startPoint: Vector2 { X: 0.0, Y: 0.0 },
+                    endPoint: Vector2 {
                         X: state.width,
-                        Y: HEADER_HEIGHT,
+                        Y: state.height,
                     },
-                    &div_brush,
-                    1.0,
-                    None,
-                );
-            }
+                },
+                None,
+                &bg_col,
+            )?;
+            ctx.FillRoundedRectangle(&full_rounded, &bg_brush);
 
-            // 3. Header: Playnite accent bar + title + count/chevron
-            let accent_blue = D2D1_COLOR_F {
-                r: 0.22,
-                g: 0.412,
-                b: 0.996,
+            // Common theme brushes
+            let coral_accent = D2D1_COLOR_F {
+                r: 0.89,
+                g: 0.32,
+                b: 0.32,
                 a: 1.0,
             };
-            let accent_brush = ctx.CreateSolidColorBrush(&accent_blue, None)?;
-            let accent_pill = D2D1_ROUNDED_RECT {
-                rect: D2D_RECT_F {
-                    left: 14.0,
-                    top: 13.0,
-                    right: 18.0,
-                    bottom: 31.0,
-                },
-                radiusX: 2.0,
-                radiusY: 2.0,
-            };
-            ctx.FillRoundedRectangle(&accent_pill, &accent_brush);
-
+            let coral_brush = ctx.CreateSolidColorBrush(&coral_accent, None)?;
             let text_white = ctx.CreateSolidColorBrush(
                 &D2D1_COLOR_F {
-                    r: 0.95,
-                    g: 0.96,
-                    b: 0.98,
-                    a: 0.98,
+                    r: 0.98,
+                    g: 0.95,
+                    b: 0.95,
+                    a: 0.99,
                 },
                 None,
             )?;
             let text_muted = ctx.CreateSolidColorBrush(
                 &D2D1_COLOR_F {
-                    r: 0.72,
-                    g: 0.78,
-                    b: 0.86,
+                    r: 0.82,
+                    g: 0.69,
+                    b: 0.71,
                     a: 0.78,
                 },
                 None,
             )?;
+            let dark_plum_brush = ctx.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 0.125,
+                    g: 0.055,
+                    b: 0.067,
+                    a: 0.82,
+                },
+                None,
+            )?;
+
+            // 2. Header: Coral rounded square emblem + Title + dark pill counter + chevron
+            let emblem = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: 16.0,
+                    top: 13.0,
+                    right: 38.0,
+                    bottom: 35.0,
+                },
+                radiusX: 7.0,
+                radiusY: 7.0,
+            };
+            ctx.FillRoundedRectangle(&emblem, &coral_brush);
+            let emblem_glyph = to_wide_null("▶");
+            ctx.DrawText(
+                &emblem_glyph[..emblem_glyph.len() - 1],
+                &self.pill_fmt,
+                &emblem.rect,
+                &text_white,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                Default::default(),
+            );
 
             let title_w = to_wide_null(state.title);
             let title_rect = D2D_RECT_F {
-                left: 26.0,
+                left: 48.0,
                 top: 0.0,
-                right: (state.width - 84.0).max(50.0),
+                right: (state.width - 94.0).max(60.0),
                 bottom: HEADER_HEIGHT,
             };
             ctx.DrawText(
@@ -489,14 +503,26 @@ impl PortalRenderer {
                 Default::default(),
             );
 
+            let pill_count_r = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: (state.width - 88.0).max(48.0),
+                    top: 12.0,
+                    right: state.width - 14.0,
+                    bottom: 36.0,
+                },
+                radiusX: 12.0,
+                radiusY: 12.0,
+            };
+            ctx.FillRoundedRectangle(&pill_count_r, &dark_plum_brush);
+
             let chevron = if state.collapsed { "▾" } else { "▴" };
             let auto_dot = if state.auto_collapse { "● " } else { "" };
             let badge_str = format!("{}{}  {}", auto_dot, state.games.len(), chevron);
             let badge_w = to_wide_null(&badge_str);
             let badge_rect = D2D_RECT_F {
-                left: (state.width - 86.0).max(26.0),
+                left: pill_count_r.rect.left + 4.0,
                 top: 0.0,
-                right: state.width - 14.0,
+                right: pill_count_r.rect.right - 10.0,
                 bottom: HEADER_HEIGHT,
             };
             ctx.DrawText(
@@ -508,349 +534,130 @@ impl PortalRenderer {
                 Default::default(),
             );
 
-            // 4. 2:3 Game Cover Grid
-            if state.height > HEADER_HEIGHT + 10.0 {
-                let grid_clip = D2D_RECT_F {
-                    left: 2.0,
-                    top: HEADER_HEIGHT + 1.0,
-                    right: state.width - 2.0,
-                    bottom: state.layout.grid_bottom.min(state.height - 2.0),
-                };
-                ctx.PushAxisAlignedClip(&grid_clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-
-                if state.games.is_empty() {
-                    let msg = to_wide_null("No hay juegos aquí — arrastra un .exe o .lnk");
-                    ctx.DrawText(
-                        &msg[..msg.len() - 1],
-                        &self.empty_fmt,
-                        &grid_clip,
-                        &text_muted,
-                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                        Default::default(),
-                    );
+            // 3. Body content (Stats ring OR Hero + Cards/List)
+            if state.height > HEADER_HEIGHT + 12.0 {
+                if state.layout.is_stats {
+                    self.draw_stats_portal(ctx, state, &text_white, &text_muted, &dark_plum_brush)?;
                 } else {
-                    let card_fallback_bg = ctx.CreateSolidColorBrush(
-                        &D2D1_COLOR_F {
-                            r: 0.11,
-                            g: 0.15,
-                            b: 0.22,
-                            a: 0.92,
-                        },
-                        None,
-                    )?;
-                    let pill_bg = ctx.CreateSolidColorBrush(
-                        &D2D1_COLOR_F {
-                            r: 0.04,
-                            g: 0.07,
-                            b: 0.10,
-                            a: 0.80,
-                        },
-                        None,
-                    )?;
-                    let hover_scrim = ctx.CreateSolidColorBrush(
-                        &D2D1_COLOR_F {
-                            r: 0.04,
-                            g: 0.07,
-                            b: 0.12,
-                            a: 0.48,
-                        },
-                        None,
-                    )?;
-                    let fav_gold = ctx.CreateSolidColorBrush(
-                        &D2D1_COLOR_F {
-                            r: 1.0,
-                            g: 0.82,
-                            b: 0.36,
-                            a: 0.98,
-                        },
-                        None,
-                    )?;
-
-                    let icon_px = ((48.0 * state.dpi) / 96.0).round() as i32;
-
-                    for (idx, game) in state.games.iter().enumerate() {
-                        let card_r = state.layout.card_rect(idx, state.scroll_y);
-                        if card_r.bottom < HEADER_HEIGHT || card_r.top > grid_clip.bottom {
-                            continue;
-                        }
-                        let cov_r = state.layout.cover_rect(idx, state.scroll_y);
-                        let cov_d2d = D2D_RECT_F {
-                            left: cov_r.left,
-                            top: cov_r.top,
-                            right: cov_r.right,
-                            bottom: cov_r.bottom,
-                        };
-                        let cov_rounded = D2D1_ROUNDED_RECT {
-                            rect: cov_d2d,
-                            radiusX: 6.0,
-                            radiusY: 6.0,
-                        };
-
-                        // Draw cover image (center-cropped into rounded 2:3 rect) or fallback card
-                        let drew_cover = if let Some(ref cpath) = game.cover_path {
-                            if let Some(bmp) = self.cover_cache.get_or_load(ctx, cpath) {
-                                draw_bitmap_cover_rounded(ctx, bmp, &cov_rounded);
-                                true
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        };
-
-                        if !drew_cover {
-                            ctx.FillRoundedRectangle(&cov_rounded, &card_fallback_bg);
-                            let icon_source =
-                                game.icon_path.as_deref().or(game.install_dir.as_deref());
-                            if let Some(ip) = icon_source {
-                                if let Some(ibmp) = self.icon_cache.get_or_load(ctx, ip, icon_px) {
-                                    let cx = cov_r.left + (cov_r.width() - 48.0) * 0.5;
-                                    let cy = cov_r.top + (COVER_HEIGHT - 48.0) * 0.5;
-                                    let ir = D2D_RECT_F {
-                                        left: cx,
-                                        top: cy,
-                                        right: cx + 48.0,
-                                        bottom: cy + 48.0,
-                                    };
-                                    ctx.DrawBitmap(
-                                        ibmp,
-                                        Some(&ir),
-                                        1.0,
-                                        D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
-                                        None,
-                                        None,
-                                    );
-                                }
-                            }
-                        }
-
-                        // Dim uninstalled games slightly
-                        if !game.is_installed {
-                            let dim_brush = ctx.CreateSolidColorBrush(
-                                &D2D1_COLOR_F {
-                                    r: 0.04,
-                                    g: 0.06,
-                                    b: 0.09,
-                                    a: 0.45,
-                                },
-                                None,
-                            )?;
-                            ctx.FillRoundedRectangle(&cov_rounded, &dim_brush);
-                        }
-
-                        // Launcher pill badge (top-left)
-                        let badge_txt = short_launcher(&game.launcher);
-                        let l_pill = D2D1_ROUNDED_RECT {
-                            rect: D2D_RECT_F {
-                                left: cov_r.left + 6.0,
-                                top: cov_r.top + 6.0,
-                                right: cov_r.left + 44.0,
-                                bottom: cov_r.top + 22.0,
-                            },
-                            radiusX: 4.0,
-                            radiusY: 4.0,
-                        };
-                        ctx.FillRoundedRectangle(&l_pill, &pill_bg);
-                        let lw = to_wide_null(badge_txt);
-                        ctx.DrawText(
-                            &lw[..lw.len() - 1],
-                            &self.pill_fmt,
-                            &l_pill.rect,
-                            &text_white,
-                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                            Default::default(),
-                        );
-
-                        // Favorite star (top-right)
-                        if game.favorite {
-                            let star_r = D2D_RECT_F {
-                                left: cov_r.right - 22.0,
-                                top: cov_r.top + 4.0,
-                                right: cov_r.right - 4.0,
-                                bottom: cov_r.top + 22.0,
-                            };
-                            let sw = to_wide_null("★");
-                            ctx.DrawText(
-                                &sw[..sw.len() - 1],
-                                &self.pill_fmt,
-                                &star_r,
-                                &fav_gold,
-                                D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                                Default::default(),
-                            );
-                        }
-
-                        let is_hovered = matches!(
-                            state.hovered,
-                            Some(HitTarget::Card(i)) | Some(HitTarget::CardPlayButton(i)) if i == idx
-                        );
-                        let is_selected = state.selected_index == Some(idx);
-
-                        if is_hovered {
-                            ctx.FillRoundedRectangle(&cov_rounded, &hover_scrim);
-
-                            // Centered Playnite Play Circle
-                            let cx = cov_r.left + cov_r.width() * 0.5;
-                            let cy = cov_r.top + COVER_HEIGHT * 0.5;
-                            let play_circle = windows::Win32::Graphics::Direct2D::D2D1_ELLIPSE {
-                                point: Vector2 { X: cx, Y: cy },
-                                radiusX: 20.0,
-                                radiusY: 20.0,
-                            };
-                            let play_hover = matches!(state.hovered, Some(HitTarget::CardPlayButton(i)) if i == idx);
-                            let circle_color = if play_hover {
-                                D2D1_COLOR_F {
-                                    r: 0.30,
-                                    g: 0.50,
-                                    b: 1.0,
-                                    a: 0.98,
-                                }
-                            } else {
-                                D2D1_COLOR_F {
-                                    r: 0.22,
-                                    g: 0.412,
-                                    b: 0.996,
-                                    a: 0.90,
-                                }
-                            };
-                            let circle_brush = ctx.CreateSolidColorBrush(&circle_color, None)?;
-                            ctx.FillEllipse(&play_circle, &circle_brush);
-
-                            let play_glyph = to_wide_null("▶");
-                            let glyph_rect = D2D_RECT_F {
-                                left: cx - 18.0,
-                                top: cy - 18.0,
-                                right: cx + 20.0,
-                                bottom: cy + 18.0,
-                            };
-                            ctx.DrawText(
-                                &play_glyph[..play_glyph.len() - 1],
-                                &self.play_btn_fmt,
-                                &glyph_rect,
+                    // Featured Coral-Crimson Hero Banner (like Valorant in reference)
+                    if let Some(hr) = state.layout.hero_rect {
+                        let sel_game = state
+                            .selected_index
+                            .and_then(|i| state.games.get(i))
+                            .or_else(|| state.games.first());
+                        if let Some(g) = sel_game {
+                            self.draw_featured_hero_card(
+                                ctx,
+                                state,
+                                hr,
+                                g,
                                 &text_white,
-                                D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                                Default::default(),
-                            );
-                        }
-
-                        if is_hovered || is_selected {
-                            ctx.DrawRoundedRectangle(&cov_rounded, &accent_brush, 2.0, None);
-                        } else {
-                            let subtle_card_rim = ctx.CreateSolidColorBrush(
-                                &D2D1_COLOR_F {
-                                    r: 1.0,
-                                    g: 1.0,
-                                    b: 1.0,
-                                    a: 0.12,
-                                },
-                                None,
+                                &coral_brush,
                             )?;
-                            ctx.DrawRoundedRectangle(&cov_rounded, &subtle_card_rim, 0.8, None);
                         }
+                    }
 
-                        // Title & Playtime below cover
-                        let t_rect = D2D_RECT_F {
-                            left: card_r.left + 1.0,
-                            top: cov_r.bottom + 5.0,
-                            right: card_r.right - 1.0,
-                            bottom: cov_r.bottom + 20.0,
-                        };
-                        let gw = to_wide_null(&game.name);
-                        ctx.DrawText(
-                            &gw[..gw.len() - 1],
-                            &self.card_title_fmt,
-                            &t_rect,
-                            &text_white,
-                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                            Default::default(),
-                        );
+                    // Games Grid / Compact List
+                    let clip_r = D2D_RECT_F {
+                        left: 2.0,
+                        top: state.layout.grid_top - 2.0,
+                        right: state.width - 2.0,
+                        bottom: state.height - 6.0,
+                    };
+                    ctx.PushAxisAlignedClip(&clip_r, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
-                        let meta_str = format_playtime(game.playtime_secs);
-                        let m_rect = D2D_RECT_F {
-                            left: card_r.left + 1.0,
-                            top: cov_r.bottom + 20.0,
-                            right: card_r.right - 1.0,
-                            bottom: card_r.bottom,
-                        };
-                        let mw = to_wide_null(&meta_str);
+                    if state.games.is_empty() {
+                        let msg = to_wide_null("No hay juegos — arrastra .exe o .lnk aquí");
                         ctx.DrawText(
-                            &mw[..mw.len() - 1],
-                            &self.card_meta_fmt,
-                            &m_rect,
+                            &msg[..msg.len() - 1],
+                            &self.empty_fmt,
+                            &clip_r,
                             &text_muted,
                             D2D1_DRAW_TEXT_OPTIONS_CLIP,
                             Default::default(),
                         );
+                    } else {
+                        match state.layout.style {
+                            LayoutStyle::Cards => {
+                                self.draw_cards_grid(
+                                    ctx,
+                                    state,
+                                    &clip_r,
+                                    &text_white,
+                                    &text_muted,
+                                    &coral_brush,
+                                )?;
+                            }
+                            LayoutStyle::CompactList => {
+                                self.draw_compact_list(
+                                    ctx,
+                                    state,
+                                    &clip_r,
+                                    &text_white,
+                                    &text_muted,
+                                    &coral_brush,
+                                )?;
+                            }
+                        }
                     }
-                }
 
-                ctx.PopAxisAlignedClip();
+                    ctx.PopAxisAlignedClip();
 
-                // Subtle scrollbar
-                if state.layout.max_scroll > 0.0 && state.layout.total_content_height > 0.0 {
-                    let track_top = HEADER_HEIGHT + 8.0;
-                    let track_h = (grid_clip.bottom - track_top - 8.0).max(20.0);
-                    let visible_h = (grid_clip.bottom - HEADER_HEIGHT).max(1.0);
-                    let thumb_h = (track_h * (visible_h / state.layout.total_content_height))
-                        .clamp(22.0, track_h);
-                    let ratio = (state.scroll_y / state.layout.max_scroll).clamp(0.0, 1.0);
-                    let thumb_top = track_top + (track_h - thumb_h) * ratio;
-                    let sb_brush = ctx.CreateSolidColorBrush(
-                        &D2D1_COLOR_F {
-                            r: 1.0,
-                            g: 1.0,
-                            b: 1.0,
-                            a: 0.28,
-                        },
-                        None,
-                    )?;
-                    let sb_rect = D2D1_ROUNDED_RECT {
-                        rect: D2D_RECT_F {
-                            left: state.width - 7.5,
-                            top: thumb_top,
-                            right: state.width - 4.0,
-                            bottom: thumb_top + thumb_h,
-                        },
-                        radiusX: 1.75,
-                        radiusY: 1.75,
-                    };
-                    ctx.FillRoundedRectangle(&sb_rect, &sb_brush);
-                }
-
-                // 5. Playnite Bottom Hero Details Drawer
-                if let Some(dr) = state.layout.details_rect {
-                    let sel_game = state
-                        .selected_index
-                        .and_then(|i| state.games.get(i))
-                        .or_else(|| state.games.first());
-                    if let Some(g) = sel_game {
-                        self.draw_details_drawer(ctx, state, dr, g, &text_white, &text_muted)?;
+                    // Subtle scrollbar
+                    if state.layout.max_scroll > 0.0 && state.layout.total_content_height > 0.0 {
+                        let track_top = state.layout.grid_top + 4.0;
+                        let track_h = (state.height - track_top - 14.0).max(20.0);
+                        let visible_h = (state.height - state.layout.grid_top).max(1.0);
+                        let thumb_h = (track_h * (visible_h / state.layout.total_content_height))
+                            .clamp(22.0, track_h);
+                        let ratio = (state.scroll_y / state.layout.max_scroll).clamp(0.0, 1.0);
+                        let thumb_top = track_top + (track_h - thumb_h) * ratio;
+                        let sb_brush = ctx.CreateSolidColorBrush(
+                            &D2D1_COLOR_F {
+                                r: 1.0,
+                                g: 0.75,
+                                b: 0.75,
+                                a: 0.25,
+                            },
+                            None,
+                        )?;
+                        let sb_rect = D2D1_ROUNDED_RECT {
+                            rect: D2D_RECT_F {
+                                left: state.width - 7.5,
+                                top: thumb_top,
+                                right: state.width - 4.0,
+                                bottom: thumb_top + thumb_h,
+                            },
+                            radiusX: 1.75,
+                            radiusY: 1.75,
+                        };
+                        ctx.FillRoundedRectangle(&sb_rect, &sb_brush);
                     }
                 }
             }
 
-            // 6. Outer glass border + drag-over highlight
+            // 4. Outer warm specular border + drag-over coral glow
             let border_color = if state.is_drag_over {
-                accent_blue
+                coral_accent
             } else {
                 D2D1_COLOR_F {
                     r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 0.18,
+                    g: 0.85,
+                    b: 0.85,
+                    a: 0.14,
                 }
             };
             let border_w = if state.is_drag_over { 2.0 } else { 1.0 };
             let border_brush = ctx.CreateSolidColorBrush(&border_color, None)?;
             let inset = D2D1_ROUNDED_RECT {
                 rect: D2D_RECT_F {
-                    left: 0.5,
-                    top: 0.5,
-                    right: (state.width - 0.5).max(1.0),
-                    bottom: (state.height - 0.5).max(1.0),
+                    left: 0.75,
+                    top: 0.75,
+                    right: (state.width - 0.75).max(1.0),
+                    bottom: (state.height - 0.75).max(1.0),
                 },
-                radiusX: (r - 0.5).max(1.0),
-                radiusY: (r - 0.5).max(1.0),
+                radiusX: (r - 0.75).max(2.0),
+                radiusY: (r - 0.75).max(2.0),
             };
             ctx.DrawRoundedRectangle(&inset, &border_brush, border_w, None);
 
@@ -859,20 +666,20 @@ impl PortalRenderer {
                 let grip_brush = ctx.CreateSolidColorBrush(
                     &D2D1_COLOR_F {
                         r: 1.0,
-                        g: 1.0,
-                        b: 1.0,
-                        a: 0.28,
+                        g: 0.82,
+                        b: 0.82,
+                        a: 0.24,
                     },
                     None,
                 )?;
                 ctx.DrawLine(
                     Vector2 {
-                        X: state.width - 13.0,
-                        Y: state.height - 5.0,
+                        X: state.width - 14.0,
+                        Y: state.height - 6.0,
                     },
                     Vector2 {
-                        X: state.width - 5.0,
-                        Y: state.height - 13.0,
+                        X: state.width - 6.0,
+                        Y: state.height - 14.0,
                     },
                     &grip_brush,
                     1.2,
@@ -885,119 +692,232 @@ impl PortalRenderer {
         }
     }
 
-    unsafe fn draw_details_drawer(
+    unsafe fn draw_featured_hero_card(
         &mut self,
         ctx: &ID2D1DeviceContext,
         state: &RenderState,
-        dr: crate::portal::RectF,
+        hr: RectF,
         game: &GameEntry,
         text_white: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
-        text_muted: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+        coral_brush: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
     ) -> windows::core::Result<()> {
-        let clip_rect = D2D_RECT_F {
-            left: 1.0,
-            top: dr.top,
-            right: state.width - 1.0,
-            bottom: dr.bottom - 1.0,
+        let hero_rr = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: hr.left,
+                top: hr.top,
+                right: hr.right,
+                bottom: hr.bottom,
+            },
+            radiusX: 16.0,
+            radiusY: 16.0,
         };
-        ctx.PushAxisAlignedClip(&clip_rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
-        // Hero artwork behind drawer
-        let hero_src = game.hero_path.as_ref().or(game.cover_path.as_ref());
-        if let Some(hp) = hero_src {
-            if let Some(bmp) = self.cover_cache.get_or_load(ctx, hp) {
-                let rr = D2D1_ROUNDED_RECT {
-                    rect: clip_rect,
-                    radiusX: 0.0,
-                    radiusY: 0.0,
-                };
-                draw_bitmap_cover_rounded(ctx, bmp, &rr);
-            }
-        }
-
-        // Playnite dark-slate gradient scrim over hero image
+        // 1. Coral-Crimson gradient base (like Valorant hero card)
         let stops = [
             D2D1_GRADIENT_STOP {
                 position: 0.0,
                 color: D2D1_COLOR_F {
-                    r: 0.055,
-                    g: 0.09,
-                    b: 0.125,
-                    a: 0.94,
+                    r: 0.91,
+                    g: 0.34,
+                    b: 0.34,
+                    a: 0.98,
                 },
             },
             D2D1_GRADIENT_STOP {
-                position: 0.65,
+                position: 0.55,
                 color: D2D1_COLOR_F {
-                    r: 0.063,
-                    g: 0.106,
-                    b: 0.145,
-                    a: 0.84,
+                    r: 0.72,
+                    g: 0.22,
+                    b: 0.29,
+                    a: 0.95,
                 },
             },
             D2D1_GRADIENT_STOP {
                 position: 1.0,
                 color: D2D1_COLOR_F {
-                    r: 0.063,
-                    g: 0.106,
-                    b: 0.145,
-                    a: 0.68,
+                    r: 0.34,
+                    g: 0.12,
+                    b: 0.20,
+                    a: 0.95,
                 },
             },
         ];
-        let stop_col = ID2D1RenderTarget::CreateGradientStopCollection(
+        let sc = ID2D1RenderTarget::CreateGradientStopCollection(
             ctx,
             &stops,
-            windows::Win32::Graphics::Direct2D::D2D1_GAMMA_2_2,
+            D2D1_GAMMA_2_2,
             D2D1_EXTEND_MODE_CLAMP,
         )?;
-        let grad_brush = ctx.CreateLinearGradientBrush(
+        let gbrush = ctx.CreateLinearGradientBrush(
             &D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
                 startPoint: Vector2 {
-                    X: clip_rect.left,
-                    Y: clip_rect.top,
+                    X: hr.left,
+                    Y: hr.top,
                 },
                 endPoint: Vector2 {
-                    X: clip_rect.right,
-                    Y: clip_rect.top,
+                    X: hr.right,
+                    Y: hr.bottom,
                 },
             },
             None,
-            &stop_col,
+            &sc,
         )?;
-        ctx.FillRectangle(&clip_rect, &grad_brush);
+        ctx.FillRoundedRectangle(&hero_rr, &gbrush);
 
-        // Top separator line
-        let div_brush = ctx.CreateSolidColorBrush(
+        // 2. Right-side blended Hero artwork
+        let art_src = game.hero_path.as_ref().or(game.cover_path.as_ref());
+        if let Some(hp) = art_src {
+            if let Some(bmp) = self.cover_cache.get_or_load(ctx, hp) {
+                let art_rr = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: hr.left + hr.width() * 0.42,
+                        top: hr.top,
+                        right: hr.right,
+                        bottom: hr.bottom,
+                    },
+                    radiusX: 16.0,
+                    radiusY: 16.0,
+                };
+                draw_bitmap_cover_rounded(ctx, bmp, &art_rr);
+
+                // Smooth horizontal fade from coral-crimson into the artwork
+                let fade_stops = [
+                    D2D1_GRADIENT_STOP {
+                        position: 0.0,
+                        color: D2D1_COLOR_F {
+                            r: 0.78,
+                            g: 0.25,
+                            b: 0.31,
+                            a: 1.0,
+                        },
+                    },
+                    D2D1_GRADIENT_STOP {
+                        position: 0.45,
+                        color: D2D1_COLOR_F {
+                            r: 0.65,
+                            g: 0.20,
+                            b: 0.26,
+                            a: 0.55,
+                        },
+                    },
+                    D2D1_GRADIENT_STOP {
+                        position: 1.0,
+                        color: D2D1_COLOR_F {
+                            r: 0.24,
+                            g: 0.09,
+                            b: 0.14,
+                            a: 0.20,
+                        },
+                    },
+                ];
+                let fsc = ID2D1RenderTarget::CreateGradientStopCollection(
+                    ctx,
+                    &fade_stops,
+                    D2D1_GAMMA_2_2,
+                    D2D1_EXTEND_MODE_CLAMP,
+                )?;
+                let fbrush = ctx.CreateLinearGradientBrush(
+                    &D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                        startPoint: Vector2 {
+                            X: art_rr.rect.left,
+                            Y: hr.top,
+                        },
+                        endPoint: Vector2 {
+                            X: hr.right,
+                            Y: hr.top,
+                        },
+                    },
+                    None,
+                    &fsc,
+                )?;
+                ctx.FillRoundedRectangle(&art_rr, &fbrush);
+            }
+        }
+
+        // 3. Pastel Yellow Pill ("★ Favorito" or "● Popular") + Dark Launcher Pill
+        let yellow_pill_bg = ctx.CreateSolidColorBrush(
             &D2D1_COLOR_F {
                 r: 1.0,
-                g: 1.0,
-                b: 1.0,
-                a: 0.14,
+                g: 0.945,
+                b: 0.66,
+                a: 0.98,
             },
             None,
         )?;
-        ctx.DrawLine(
-            Vector2 { X: 0.0, Y: dr.top },
-            Vector2 {
-                X: state.width,
-                Y: dr.top,
+        let dark_text = ctx.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 0.16,
+                g: 0.08,
+                b: 0.08,
+                a: 1.0,
             },
-            &div_brush,
-            1.0,
             None,
+        )?;
+        let tag_rect = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: hr.left + 16.0,
+                top: hr.top + 14.0,
+                right: hr.left + 94.0,
+                bottom: hr.top + 34.0,
+            },
+            radiusX: 10.0,
+            radiusY: 10.0,
+        };
+        ctx.FillRoundedRectangle(&tag_rect, &yellow_pill_bg);
+        let tag_txt = to_wide_null(if game.favorite {
+            "★ Favorito"
+        } else {
+            "● Destacado"
+        });
+        ctx.DrawText(
+            &tag_txt[..tag_txt.len() - 1],
+            &self.pill_fmt,
+            &tag_rect.rect,
+            &dark_text,
+            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+            Default::default(),
         );
 
-        // Title + Metadata + Playtime/LastPlayed
-        let title_r = D2D_RECT_F {
-            left: 16.0,
-            top: dr.top + 12.0,
-            right: state.width - 16.0,
-            bottom: dr.top + 38.0,
+        let dark_badge = ctx.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 0.12,
+                g: 0.05,
+                b: 0.07,
+                a: 0.60,
+            },
+            None,
+        )?;
+        let plat_rect = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: hr.left + 102.0,
+                top: hr.top + 14.0,
+                right: hr.left + 158.0,
+                bottom: hr.top + 34.0,
+            },
+            radiusX: 10.0,
+            radiusY: 10.0,
         };
-        let tw = to_wide_null(&game.name);
+        ctx.FillRoundedRectangle(&plat_rect, &dark_badge);
+        let plat_txt = to_wide_null(short_launcher(&game.launcher));
         ctx.DrawText(
-            &tw[..tw.len() - 1],
+            &plat_txt[..plat_txt.len() - 1],
+            &self.pill_fmt,
+            &plat_rect.rect,
+            text_white,
+            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+            Default::default(),
+        );
+
+        // 4. Game Title + Metadata Description
+        let title_r = D2D_RECT_F {
+            left: hr.left + 16.0,
+            top: hr.top + 42.0,
+            right: (hr.right - 16.0).max(hr.left + 80.0),
+            bottom: hr.top + 68.0,
+        };
+        let gw = to_wide_null(&game.name);
+        ctx.DrawText(
+            &gw[..gw.len() - 1],
             &self.hero_title_fmt,
             &title_r,
             text_white,
@@ -1005,9 +925,9 @@ impl PortalRenderer {
             Default::default(),
         );
 
-        let mut meta_parts = vec![game.launcher.clone()];
+        let mut parts = Vec::new();
         if !game.genres.is_empty() {
-            meta_parts.push(
+            parts.push(
                 game.genres
                     .iter()
                     .take(2)
@@ -1017,136 +937,851 @@ impl PortalRenderer {
             );
         }
         if !game.developers.is_empty() {
-            meta_parts.push(game.developers[0].clone());
+            parts.push(game.developers[0].clone());
         }
         if let Some(y) = game.release_year {
-            meta_parts.push(y.to_string());
+            parts.push(y.to_string());
         }
-        let meta_line = meta_parts.join("  •  ");
-        let meta_r = D2D_RECT_F {
-            left: 16.0,
-            top: dr.top + 40.0,
-            right: state.width - 16.0,
-            bottom: dr.top + 58.0,
-        };
-        let mw = to_wide_null(&meta_line);
-        ctx.DrawText(
-            &mw[..mw.len() - 1],
-            &self.card_title_fmt,
-            &meta_r,
-            text_muted,
-            D2D1_DRAW_TEXT_OPTIONS_CLIP,
-            Default::default(),
-        );
-
-        let score_part = game
-            .community_score
-            .map(|s| format!("  •  Score {s}%"))
-            .unwrap_or_default();
-        let stats_line = format!(
-            "Tiempo: {}  •  Última vez: {}{}",
+        parts.push(format!(
+            "{} • {}",
             format_playtime(game.playtime_secs),
-            format_last_played(game.last_played_unix),
-            score_part
-        );
-        let stats_r = D2D_RECT_F {
-            left: 16.0,
-            top: dr.top + 62.0,
-            right: (state.width - 172.0).max(60.0),
-            bottom: dr.bottom - 14.0,
+            format_last_played(game.last_played_unix)
+        ));
+        let sub = parts.join("  •  ");
+        let sub_r = D2D_RECT_F {
+            left: hr.left + 16.0,
+            top: hr.top + 72.0,
+            right: (hr.right - 20.0).max(hr.left + 80.0),
+            bottom: hr.top + 94.0,
         };
-        let sw = to_wide_null(&stats_line);
+        let sw = to_wide_null(&sub);
+        let sub_brush = ctx.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 1.0,
+                g: 0.90,
+                b: 0.90,
+                a: 0.88,
+            },
+            None,
+        )?;
         ctx.DrawText(
             &sw[..sw.len() - 1],
             &self.card_meta_fmt,
-            &stats_r,
-            text_muted,
+            &sub_r,
+            &sub_brush,
             D2D1_DRAW_TEXT_OPTIONS_CLIP,
             Default::default(),
         );
 
-        // Favorite toggle button
-        if let Some(fav_r) = state.layout.details_fav_rect {
-            let hover_fav = matches!(state.hovered, Some(HitTarget::DetailsFavButton));
-            let fav_bg = ctx.CreateSolidColorBrush(
+        // 5. Crisp White "▶ Jugar" Pill + Circular Favorite button
+        if let Some(play_r) = state.layout.hero_play_rect {
+            let hovering = matches!(state.hovered, Some(HitTarget::HeroPlayButton));
+            let white_pill = ctx.CreateSolidColorBrush(
                 &D2D1_COLOR_F {
                     r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: if hover_fav { 0.22 } else { 0.12 },
-                },
-                None,
-            )?;
-            let rr = D2D1_ROUNDED_RECT {
-                rect: D2D_RECT_F {
-                    left: fav_r.left,
-                    top: fav_r.top,
-                    right: fav_r.right,
-                    bottom: fav_r.bottom,
-                },
-                radiusX: 8.0,
-                radiusY: 8.0,
-            };
-            ctx.FillRoundedRectangle(&rr, &fav_bg);
-            let star_brush = if game.favorite {
-                ctx.CreateSolidColorBrush(
-                    &D2D1_COLOR_F {
-                        r: 1.0,
-                        g: 0.82,
-                        b: 0.36,
-                        a: 1.0,
-                    },
-                    None,
-                )?
-            } else {
-                text_white.clone()
-            };
-            let fg = to_wide_null(if game.favorite { "★" } else { "☆" });
-            ctx.DrawText(
-                &fg[..fg.len() - 1],
-                &self.play_btn_fmt,
-                &rr.rect,
-                &star_brush,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                Default::default(),
-            );
-        }
-
-        // Playnite Blue Play button
-        if let Some(play_r) = state.layout.details_play_rect {
-            let hover_play = matches!(state.hovered, Some(HitTarget::DetailsPlayButton));
-            let btn_bg = ctx.CreateSolidColorBrush(
-                &D2D1_COLOR_F {
-                    r: if hover_play { 0.29 } else { 0.22 },
-                    g: if hover_play { 0.49 } else { 0.412 },
-                    b: 0.996,
+                    g: if hovering { 0.93 } else { 0.98 },
+                    b: if hovering { 0.93 } else { 0.98 },
                     a: 1.0,
                 },
                 None,
             )?;
-            let rr = D2D1_ROUNDED_RECT {
+            let pr = D2D1_ROUNDED_RECT {
                 rect: D2D_RECT_F {
                     left: play_r.left,
                     top: play_r.top,
                     right: play_r.right,
                     bottom: play_r.bottom,
                 },
-                radiusX: 8.0,
-                radiusY: 8.0,
+                radiusX: 14.0,
+                radiusY: 14.0,
             };
-            ctx.FillRoundedRectangle(&rr, &btn_bg);
-            let label = to_wide_null("▶  JUGAR");
+            ctx.FillRoundedRectangle(&pr, &white_pill);
+            let lbl = to_wide_null("▶  Jugar");
             ctx.DrawText(
-                &label[..label.len() - 1],
+                &lbl[..lbl.len() - 1],
                 &self.play_btn_fmt,
-                &rr.rect,
+                &pr.rect,
+                coral_brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                Default::default(),
+            );
+        }
+
+        if let Some(fav_r) = state.layout.hero_fav_rect {
+            let hovering = matches!(state.hovered, Some(HitTarget::HeroFavButton));
+            let fav_bg = ctx.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 0.12,
+                    g: 0.05,
+                    b: 0.07,
+                    a: if hovering { 0.72 } else { 0.50 },
+                },
+                None,
+            )?;
+            let fr = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: fav_r.left,
+                    top: fav_r.top,
+                    right: fav_r.right,
+                    bottom: fav_r.bottom,
+                },
+                radiusX: 14.0,
+                radiusY: 14.0,
+            };
+            ctx.FillRoundedRectangle(&fr, &fav_bg);
+            let star = to_wide_null(if game.favorite { "★" } else { "☆" });
+            let star_brush = if game.favorite {
+                yellow_pill_bg
+            } else {
+                text_white.clone()
+            };
+            ctx.DrawText(
+                &star[..star.len() - 1],
+                &self.play_btn_fmt,
+                &fr.rect,
+                &star_brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                Default::default(),
+            );
+        }
+
+        Ok(())
+    }
+
+    unsafe fn draw_cards_grid(
+        &mut self,
+        ctx: &ID2D1DeviceContext,
+        state: &RenderState,
+        clip_r: &D2D_RECT_F,
+        text_white: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+        text_muted: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+        coral_brush: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+    ) -> windows::core::Result<()> {
+        let fallback_bg = ctx.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 0.21,
+                g: 0.10,
+                b: 0.125,
+                a: 0.94,
+            },
+            None,
+        )?;
+        let white_circle = ctx.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 1.0,
+                g: 0.96,
+                b: 0.96,
+                a: 0.94,
+            },
+            None,
+        )?;
+        let dark_circle = ctx.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 0.12,
+                g: 0.05,
+                b: 0.07,
+                a: 0.72,
+            },
+            None,
+        )?;
+        let yellow_star = ctx.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 1.0,
+                g: 0.91,
+                b: 0.52,
+                a: 1.0,
+            },
+            None,
+        )?;
+
+        let icon_px = ((48.0 * state.dpi) / 96.0).round() as i32;
+
+        for (idx, game) in state.games.iter().enumerate() {
+            let card_r = state.layout.card_rect(idx, state.scroll_y);
+            if card_r.bottom < clip_r.top || card_r.top > clip_r.bottom {
+                continue;
+            }
+            let card_rr = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: card_r.left,
+                    top: card_r.top,
+                    right: card_r.right,
+                    bottom: card_r.bottom,
+                },
+                radiusX: 16.0,
+                radiusY: 16.0,
+            };
+
+            let drew_cover = if let Some(ref cpath) = game.cover_path {
+                if let Some(bmp) = self.cover_cache.get_or_load(ctx, cpath) {
+                    draw_bitmap_cover_rounded(ctx, bmp, &card_rr);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !drew_cover {
+                ctx.FillRoundedRectangle(&card_rr, &fallback_bg);
+                let icon_src = game.icon_path.as_deref().or(game.install_dir.as_deref());
+                if let Some(ip) = icon_src {
+                    if let Some(ibmp) = self.icon_cache.get_or_load(ctx, ip, icon_px) {
+                        let cx = card_r.left + (card_r.width() - 48.0) * 0.5;
+                        let cy = card_r.top + 38.0;
+                        let ir = D2D_RECT_F {
+                            left: cx,
+                            top: cy,
+                            right: cx + 48.0,
+                            bottom: cy + 48.0,
+                        };
+                        ctx.DrawBitmap(
+                            ibmp,
+                            Some(&ir),
+                            1.0,
+                            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                            None,
+                            None,
+                        );
+                    }
+                }
+            }
+
+            // Rich bottom dark-burgundy scrim inside card (like Uncharted 4 / Dishonored)
+            let scrim_stops = [
+                D2D1_GRADIENT_STOP {
+                    position: 0.0,
+                    color: D2D1_COLOR_F {
+                        r: 0.10,
+                        g: 0.04,
+                        b: 0.05,
+                        a: 0.0,
+                    },
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 0.52,
+                    color: D2D1_COLOR_F {
+                        r: 0.10,
+                        g: 0.04,
+                        b: 0.05,
+                        a: 0.52,
+                    },
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 1.0,
+                    color: D2D1_COLOR_F {
+                        r: 0.08,
+                        g: 0.03,
+                        b: 0.04,
+                        a: 0.94,
+                    },
+                },
+            ];
+            let ssc = ID2D1RenderTarget::CreateGradientStopCollection(
+                ctx,
+                &scrim_stops,
+                D2D1_GAMMA_2_2,
+                D2D1_EXTEND_MODE_CLAMP,
+            )?;
+            let sbrush = ctx.CreateLinearGradientBrush(
+                &D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                    startPoint: Vector2 {
+                        X: card_r.left,
+                        Y: card_r.top + 42.0,
+                    },
+                    endPoint: Vector2 {
+                        X: card_r.left,
+                        Y: card_r.bottom,
+                    },
+                },
+                None,
+                &ssc,
+            )?;
+            ctx.FillRoundedRectangle(&card_rr, &sbrush);
+
+            // Top-left Coral Play circle
+            let play_r = state.layout.card_play_rect(idx, state.scroll_y);
+            let play_ell = D2D1_ELLIPSE {
+                point: Vector2 {
+                    X: (play_r.left + play_r.right) * 0.5,
+                    Y: (play_r.top + play_r.bottom) * 0.5,
+                },
+                radiusX: 15.0,
+                radiusY: 15.0,
+            };
+            let play_hover =
+                matches!(state.hovered, Some(HitTarget::CardPlayButton(i)) if i == idx);
+            if play_hover {
+                ctx.FillEllipse(&play_ell, &white_circle);
+                let g = to_wide_null("▶");
+                ctx.DrawText(
+                    &g[..g.len() - 1],
+                    &self.pill_fmt,
+                    &D2D_RECT_F {
+                        left: play_r.left,
+                        top: play_r.top,
+                        right: play_r.right,
+                        bottom: play_r.bottom,
+                    },
+                    coral_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    Default::default(),
+                );
+            } else {
+                ctx.FillEllipse(&play_ell, coral_brush);
+                let g = to_wide_null("▶");
+                ctx.DrawText(
+                    &g[..g.len() - 1],
+                    &self.pill_fmt,
+                    &D2D_RECT_F {
+                        left: play_r.left,
+                        top: play_r.top,
+                        right: play_r.right,
+                        bottom: play_r.bottom,
+                    },
+                    text_white,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    Default::default(),
+                );
+            }
+
+            // Top-right Favorite circle
+            let fav_r = state.layout.card_fav_rect(idx, state.scroll_y);
+            let fav_ell = D2D1_ELLIPSE {
+                point: Vector2 {
+                    X: (fav_r.left + fav_r.right) * 0.5,
+                    Y: (fav_r.top + fav_r.bottom) * 0.5,
+                },
+                radiusX: 13.0,
+                radiusY: 13.0,
+            };
+            ctx.FillEllipse(
+                &fav_ell,
+                if game.favorite {
+                    &white_circle
+                } else {
+                    &dark_circle
+                },
+            );
+            let star_w = to_wide_null(if game.favorite { "★" } else { "☆" });
+            ctx.DrawText(
+                &star_w[..star_w.len() - 1],
+                &self.pill_fmt,
+                &D2D_RECT_F {
+                    left: fav_r.left,
+                    top: fav_r.top,
+                    right: fav_r.right,
+                    bottom: fav_r.bottom,
+                },
+                if game.favorite {
+                    coral_brush
+                } else {
+                    &yellow_star
+                },
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                Default::default(),
+            );
+
+            // Title & Playtime inside bottom of card
+            let t_rect = D2D_RECT_F {
+                left: card_r.left + 12.0,
+                top: card_r.bottom - 44.0,
+                right: card_r.right - 10.0,
+                bottom: card_r.bottom - 24.0,
+            };
+            let gw = to_wide_null(&game.name);
+            ctx.DrawText(
+                &gw[..gw.len() - 1],
+                &self.card_title_fmt,
+                &t_rect,
+                text_white,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                Default::default(),
+            );
+
+            let meta = format!(
+                "{} • {}",
+                short_launcher(&game.launcher),
+                format_playtime(game.playtime_secs)
+            );
+            let m_rect = D2D_RECT_F {
+                left: card_r.left + 12.0,
+                top: card_r.bottom - 24.0,
+                right: card_r.right - 10.0,
+                bottom: card_r.bottom - 6.0,
+            };
+            let mw = to_wide_null(&meta);
+            ctx.DrawText(
+                &mw[..mw.len() - 1],
+                &self.card_meta_fmt,
+                &m_rect,
+                text_muted,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                Default::default(),
+            );
+
+            let is_hovered = matches!(
+                state.hovered,
+                Some(HitTarget::Card(i))
+                    | Some(HitTarget::CardPlayButton(i))
+                    | Some(HitTarget::CardFavButton(i))
+                    if i == idx
+            );
+            let is_selected = state.selected_index == Some(idx);
+            if is_hovered || is_selected {
+                ctx.DrawRoundedRectangle(&card_rr, coral_brush, 2.0, None);
+            } else {
+                let rim = ctx.CreateSolidColorBrush(
+                    &D2D1_COLOR_F {
+                        r: 1.0,
+                        g: 0.85,
+                        b: 0.85,
+                        a: 0.14,
+                    },
+                    None,
+                )?;
+                ctx.DrawRoundedRectangle(&card_rr, &rim, 0.9, None);
+            }
+        }
+
+        Ok(())
+    }
+
+    unsafe fn draw_compact_list(
+        &mut self,
+        ctx: &ID2D1DeviceContext,
+        state: &RenderState,
+        clip_r: &D2D_RECT_F,
+        text_white: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+        text_muted: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+        coral_brush: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+    ) -> windows::core::Result<()> {
+        let row_bg = ctx.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 0.11,
+                g: 0.048,
+                b: 0.058,
+                a: 0.86,
+            },
+            None,
+        )?;
+        let row_hover_bg = ctx.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 0.19,
+                g: 0.082,
+                b: 0.10,
+                a: 0.92,
+            },
+            None,
+        )?;
+        let thumb_bg = ctx.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 0.25,
+                g: 0.12,
+                b: 0.14,
+                a: 0.95,
+            },
+            None,
+        )?;
+        let icon_px = ((38.0 * state.dpi) / 96.0).round() as i32;
+
+        for (idx, game) in state.games.iter().enumerate() {
+            let r = state.layout.card_rect(idx, state.scroll_y);
+            if r.bottom < clip_r.top || r.top > clip_r.bottom {
+                continue;
+            }
+            let rr = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: r.left,
+                    top: r.top,
+                    right: r.right,
+                    bottom: r.bottom,
+                },
+                radiusX: 14.0,
+                radiusY: 14.0,
+            };
+
+            let is_hovered = matches!(
+                state.hovered,
+                Some(HitTarget::Card(i))
+                    | Some(HitTarget::CardPlayButton(i))
+                    | Some(HitTarget::CardFavButton(i))
+                    if i == idx
+            );
+            ctx.FillRoundedRectangle(&rr, if is_hovered { &row_hover_bg } else { &row_bg });
+
+            // Square rounded thumbnail on left
+            let thumb = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: r.left + 8.0,
+                    top: r.top + 8.0,
+                    right: r.left + 46.0,
+                    bottom: r.bottom - 8.0,
+                },
+                radiusX: 10.0,
+                radiusY: 10.0,
+            };
+            let drew = if let Some(ref cp) = game.cover_path {
+                if let Some(bmp) = self.cover_cache.get_or_load(ctx, cp) {
+                    draw_bitmap_cover_rounded(ctx, bmp, &thumb);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !drew {
+                ctx.FillRoundedRectangle(&thumb, &thumb_bg);
+                if let Some(ip) = game.icon_path.as_deref().or(game.install_dir.as_deref()) {
+                    if let Some(ibmp) = self.icon_cache.get_or_load(ctx, ip, icon_px) {
+                        ctx.DrawBitmap(
+                            ibmp,
+                            Some(&thumb.rect),
+                            1.0,
+                            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                            None,
+                            None,
+                        );
+                    }
+                }
+            }
+
+            // Title & metadata
+            let title_r = D2D_RECT_F {
+                left: r.left + 58.0,
+                top: r.top + 10.0,
+                right: r.right - 50.0,
+                bottom: r.top + 28.0,
+            };
+            let gw = to_wide_null(&game.name);
+            ctx.DrawText(
+                &gw[..gw.len() - 1],
+                &self.card_title_fmt,
+                &title_r,
+                text_white,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                Default::default(),
+            );
+
+            let sub = format!(
+                "{} • {}",
+                game.launcher,
+                format_playtime(game.playtime_secs)
+            );
+            let sub_r = D2D_RECT_F {
+                left: r.left + 58.0,
+                top: r.top + 29.0,
+                right: r.right - 50.0,
+                bottom: r.bottom - 8.0,
+            };
+            let sw = to_wide_null(&sub);
+            ctx.DrawText(
+                &sw[..sw.len() - 1],
+                &self.card_meta_fmt,
+                &sub_r,
+                text_muted,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                Default::default(),
+            );
+
+            // Right circular play arrow button (like Unravel 2 / Subway Surf rows)
+            let pr = state.layout.card_play_rect(idx, state.scroll_y);
+            let play_hover =
+                matches!(state.hovered, Some(HitTarget::CardPlayButton(i)) if i == idx);
+            let ell = D2D1_ELLIPSE {
+                point: Vector2 {
+                    X: (pr.left + pr.right) * 0.5,
+                    Y: (pr.top + pr.bottom) * 0.5,
+                },
+                radiusX: 13.0,
+                radiusY: 13.0,
+            };
+            let circle_bg = if play_hover {
+                coral_brush.clone()
+            } else {
+                ctx.CreateSolidColorBrush(
+                    &D2D1_COLOR_F {
+                        r: 1.0,
+                        g: 0.85,
+                        b: 0.85,
+                        a: 0.12,
+                    },
+                    None,
+                )?
+            };
+            ctx.FillEllipse(&ell, &circle_bg);
+            let arrow = to_wide_null("›");
+            ctx.DrawText(
+                &arrow[..arrow.len() - 1],
+                &self.play_btn_fmt,
+                &D2D_RECT_F {
+                    left: pr.left,
+                    top: pr.top - 1.0,
+                    right: pr.right,
+                    bottom: pr.bottom,
+                },
                 text_white,
                 D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 Default::default(),
             );
         }
 
-        ctx.PopAxisAlignedClip();
+        Ok(())
+    }
+
+    unsafe fn draw_stats_portal(
+        &mut self,
+        ctx: &ID2D1DeviceContext,
+        state: &RenderState,
+        text_white: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+        text_muted: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+        dark_plum_brush: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+    ) -> windows::core::Result<()> {
+        let card_rr = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: 16.0,
+                top: HEADER_HEIGHT + 6.0,
+                right: state.width - 16.0,
+                bottom: state.height - 16.0,
+            },
+            radiusX: 16.0,
+            radiusY: 16.0,
+        };
+        let panel_bg = ctx.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 0.19,
+                g: 0.088,
+                b: 0.11,
+                a: 0.85,
+            },
+            None,
+        )?;
+        ctx.FillRoundedRectangle(&card_rr, &panel_bg);
+
+        let cx = state.width * 0.5;
+        let cy = HEADER_HEIGHT + (state.height - HEADER_HEIGHT - 86.0).max(110.0) * 0.5;
+
+        // Multi-layered glowing ring (coral, soft gold, lavender) matching "Your Statistic"
+        let ring_layers = [
+            (
+                -6.0,
+                -4.0,
+                56.0,
+                D2D1_COLOR_F {
+                    r: 0.90,
+                    g: 0.34,
+                    b: 0.34,
+                    a: 0.85,
+                },
+            ),
+            (
+                6.0,
+                -2.0,
+                55.0,
+                D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 0.88,
+                    b: 0.62,
+                    a: 0.78,
+                },
+            ),
+            (
+                0.0,
+                6.0,
+                55.0,
+                D2D1_COLOR_F {
+                    r: 0.56,
+                    g: 0.45,
+                    b: 0.96,
+                    a: 0.80,
+                },
+            ),
+        ];
+
+        for (ox, oy, rad, col) in ring_layers {
+            let b = ctx.CreateSolidColorBrush(&col, None)?;
+            ctx.FillEllipse(
+                &D2D1_ELLIPSE {
+                    point: Vector2 {
+                        X: cx + ox,
+                        Y: cy + oy,
+                    },
+                    radiusX: rad,
+                    radiusY: rad,
+                },
+                &b,
+            );
+        }
+
+        // Inner dark center disc
+        ctx.FillEllipse(
+            &D2D1_ELLIPSE {
+                point: Vector2 { X: cx, Y: cy },
+                radiusX: 46.0,
+                radiusY: 46.0,
+            },
+            dark_plum_brush,
+        );
+
+        let lbl_top = to_wide_null("Total horas");
+        ctx.DrawText(
+            &lbl_top[..lbl_top.len() - 1],
+            &self.card_meta_fmt,
+            &D2D_RECT_F {
+                left: cx - 44.0,
+                top: cy - 22.0,
+                right: cx + 44.0,
+                bottom: cy - 4.0,
+            },
+            text_muted,
+            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+            Default::default(),
+        );
+        // Center align "Total horas" via pill_fmt
+        ctx.DrawText(
+            &lbl_top[..lbl_top.len() - 1],
+            &self.pill_fmt,
+            &D2D_RECT_F {
+                left: cx - 44.0,
+                top: cy - 24.0,
+                right: cx + 44.0,
+                bottom: cy - 4.0,
+            },
+            text_muted,
+            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+            Default::default(),
+        );
+
+        let total_h = state.total_library_secs / 3600;
+        let total_str = format!("{total_h}h");
+        let total_w = to_wide_null(&total_str);
+        ctx.DrawText(
+            &total_w[..total_w.len() - 1],
+            &self.stats_big_fmt,
+            &D2D_RECT_F {
+                left: cx - 46.0,
+                top: cy - 4.0,
+                right: cx + 46.0,
+                bottom: cy + 28.0,
+            },
+            text_white,
+            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+            Default::default(),
+        );
+
+        // Top 3 most played games underneath
+        let badge_colors = [
+            D2D1_COLOR_F {
+                r: 0.89,
+                g: 0.32,
+                b: 0.32,
+                a: 0.95,
+            },
+            D2D1_COLOR_F {
+                r: 1.0,
+                g: 0.92,
+                b: 0.62,
+                a: 0.95,
+            },
+            D2D1_COLOR_F {
+                r: 0.49,
+                g: 0.42,
+                b: 0.92,
+                a: 0.95,
+            },
+        ];
+        let icon_px = ((26.0 * state.dpi) / 96.0).round() as i32;
+
+        for (i, game) in state.games.iter().take(3).enumerate() {
+            let slot = state.layout.stats_top_rects[i];
+            let slot_cx = (slot.left + slot.right) * 0.5;
+            let circle_cy = slot.top + 22.0;
+
+            let hover = matches!(state.hovered, Some(HitTarget::StatsTopGame(idx)) if idx == i);
+            let bg = ctx.CreateSolidColorBrush(&badge_colors[i % 3], None)?;
+            ctx.FillEllipse(
+                &D2D1_ELLIPSE {
+                    point: Vector2 {
+                        X: slot_cx,
+                        Y: circle_cy,
+                    },
+                    radiusX: if hover { 21.0 } else { 19.0 },
+                    radiusY: if hover { 21.0 } else { 19.0 },
+                },
+                &bg,
+            );
+
+            let icon_src = game.icon_path.as_deref().or(game.install_dir.as_deref());
+            let mut drew_icon = false;
+            if let Some(ip) = icon_src {
+                if let Some(ibmp) = self.icon_cache.get_or_load(ctx, ip, icon_px) {
+                    let ir = D2D_RECT_F {
+                        left: slot_cx - 11.0,
+                        top: circle_cy - 11.0,
+                        right: slot_cx + 11.0,
+                        bottom: circle_cy + 11.0,
+                    };
+                    ctx.DrawBitmap(
+                        ibmp,
+                        Some(&ir),
+                        1.0,
+                        D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                        None,
+                        None,
+                    );
+                    drew_icon = true;
+                }
+            }
+            if !drew_icon {
+                let initial = game.name.chars().next().unwrap_or('G').to_string();
+                let iw = to_wide_null(&initial);
+                let fg = if i == 1 {
+                    ctx.CreateSolidColorBrush(
+                        &D2D1_COLOR_F {
+                            r: 0.16,
+                            g: 0.08,
+                            b: 0.08,
+                            a: 1.0,
+                        },
+                        None,
+                    )?
+                } else {
+                    text_white.clone()
+                };
+                ctx.DrawText(
+                    &iw[..iw.len() - 1],
+                    &self.play_btn_fmt,
+                    &D2D_RECT_F {
+                        left: slot_cx - 16.0,
+                        top: circle_cy - 16.0,
+                        right: slot_cx + 16.0,
+                        bottom: circle_cy + 16.0,
+                    },
+                    &fg,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    Default::default(),
+                );
+            }
+
+            let hrs = format_playtime(game.playtime_secs);
+            let hw = to_wide_null(&hrs);
+            ctx.DrawText(
+                &hw[..hw.len() - 1],
+                &self.pill_fmt,
+                &D2D_RECT_F {
+                    left: slot.left,
+                    top: circle_cy + 22.0,
+                    right: slot.right,
+                    bottom: circle_cy + 38.0,
+                },
+                text_white,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                Default::default(),
+            );
+        }
+
         Ok(())
     }
 }
@@ -1230,12 +1865,12 @@ mod tests {
     }
 
     #[test]
-    fn playnite_visual_render_smoke_and_capture() {
+    fn burgundy_theme_visual_render_smoke() {
         unsafe {
             let _ = OleInitialize(None);
             let hinst: windows::Win32::Foundation::HINSTANCE =
                 GetModuleHandleW(None).unwrap_or_default().into();
-            let cls = to_wide_null("ODDPlayniteVisualTest");
+            let cls = to_wide_null("ODDBurgundyVisualTest");
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
                 lpfnWndProc: Some(test_wnd_proc),
@@ -1253,7 +1888,7 @@ mod tests {
                 40,
                 40,
                 520,
-                440,
+                496,
                 None,
                 None,
                 Some(hinst),
@@ -1261,8 +1896,8 @@ mod tests {
             )
             .expect("CreateWindowExW failed");
 
-            let mut renderer =
-                PortalRenderer::new(hwnd, 520, 440, 96.0, 8.0).expect("PortalRenderer::new failed");
+            let mut renderer = PortalRenderer::new(hwnd, 520, 496, 96.0, 18.0)
+                .expect("PortalRenderer::new failed");
 
             let games = vec![
                 GameEntry {
@@ -1289,7 +1924,7 @@ mod tests {
                 },
                 GameEntry {
                     id: "epic:celeste".into(),
-                    name: "Celeste".into(),
+                    name: "Dishonored: Standard".into(),
                     launcher: "Epic".into(),
                     steam_appid: None,
                     launch_target: String::new(),
@@ -1297,10 +1932,10 @@ mod tests {
                     cover_path: None,
                     hero_path: None,
                     icon_path: Some(std::path::PathBuf::from(r"C:\Windows\explorer.exe")),
-                    genres: vec!["Platformer".into()],
-                    developers: vec!["Maddy Makes Games".into()],
+                    genres: vec!["Action".into()],
+                    developers: vec!["Arkane Studios".into()],
                     platforms: vec!["PC (Windows)".into()],
-                    release_year: Some(2018),
+                    release_year: Some(2012),
                     community_score: Some(95),
                     playtime_secs: 34_200,
                     play_count: 8,
@@ -1309,16 +1944,40 @@ mod tests {
                     is_installed: true,
                     favorite: false,
                 },
+                GameEntry {
+                    id: "steam:1245620".into(),
+                    name: "Elden Ring".into(),
+                    launcher: "Steam".into(),
+                    steam_appid: Some("1245620".into()),
+                    launch_target: String::new(),
+                    install_dir: None,
+                    cover_path: None,
+                    hero_path: None,
+                    icon_path: Some(std::path::PathBuf::from(r"C:\Windows\notepad.exe")),
+                    genres: vec!["RPG".into()],
+                    developers: vec!["FromSoftware".into()],
+                    platforms: vec!["PC (Windows)".into()],
+                    release_year: Some(2022),
+                    community_score: Some(96),
+                    playtime_secs: 420_000,
+                    play_count: 42,
+                    last_played_unix: 1_794_000_000,
+                    added_unix: 0,
+                    is_installed: true,
+                    favorite: true,
+                },
             ];
 
-            let layout = GameGridLayout::compute(520.0, 440.0, games.len(), true);
+            let layout =
+                GameGridLayout::compute(520.0, 496.0, games.len(), true, LayoutStyle::Cards, false);
             let theme = PortalTheme::default();
             let state = RenderState {
                 title: "Jugados recientemente",
                 games: &games,
+                total_library_secs: 607_200,
                 layout: &layout,
                 width: 520.0,
-                height: 440.0,
+                height: 496.0,
                 dpi: 96.0,
                 scroll_y: 0.0,
                 hovered: Some(HitTarget::CardPlayButton(0)),
@@ -1349,7 +2008,7 @@ mod tests {
                 .CreateBitmap(
                     windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U {
                         width: 520,
-                        height: 440,
+                        height: 496,
                     },
                     None,
                     0,
@@ -1362,29 +2021,29 @@ mod tests {
                 .expect("CopyFromBitmap");
             let mapped: D2D1_MAPPED_RECT = cpu_bmp.Map(D2D1_MAP_OPTIONS_READ).expect("Map");
 
-            let mut non_zero = 0usize;
             let cap_path = std::env::var_os("ODD_CAPTURE_BMP");
             let mut bmp_bytes = if cap_path.is_some() {
-                let mut v = Vec::with_capacity(54 + 520 * 440 * 4);
-                let file_size = (54 + 520 * 440 * 4) as u32;
+                let mut v = Vec::with_capacity(54 + 520 * 496 * 4);
+                let file_size = (54 + 520 * 496 * 4) as u32;
                 v.extend_from_slice(b"BM");
                 v.extend_from_slice(&file_size.to_le_bytes());
                 v.extend_from_slice(&0u32.to_le_bytes());
                 v.extend_from_slice(&54u32.to_le_bytes());
                 v.extend_from_slice(&40u32.to_le_bytes());
                 v.extend_from_slice(&520i32.to_le_bytes());
-                v.extend_from_slice(&(-440i32).to_le_bytes());
+                v.extend_from_slice(&(-496i32).to_le_bytes());
                 v.extend_from_slice(&1u16.to_le_bytes());
                 v.extend_from_slice(&32u16.to_le_bytes());
                 v.extend_from_slice(&0u32.to_le_bytes());
-                v.extend_from_slice(&((520 * 440 * 4) as u32).to_le_bytes());
+                v.extend_from_slice(&((520 * 496 * 4) as u32).to_le_bytes());
                 v.extend_from_slice(&[0u8; 16]);
                 v
             } else {
                 Vec::new()
             };
 
-            for y in 0..440usize {
+            let mut non_zero = 0usize;
+            for y in 0..496usize {
                 let row =
                     std::slice::from_raw_parts(mapped.bits.add(y * mapped.pitch as usize), 520 * 4);
                 for x in 0..520usize {
@@ -1397,9 +2056,10 @@ mod tests {
                     }
                     if cap_path.is_some() {
                         let af = a as f32 / 255.0;
-                        let bg_r = 35.0 + (x as f32 / 520.0) * 60.0;
-                        let bg_g = 60.0 + (y as f32 / 440.0) * 55.0;
-                        let bg_b = 125.0 - (x as f32 / 520.0) * 20.0;
+                        // Warm peach-cream canvas backdrop like the reference presentation
+                        let bg_r = 245.0;
+                        let bg_g = 228.0;
+                        let bg_b = 226.0;
                         bmp_bytes.push((b + bg_b * (1.0 - af)).clamp(0.0, 255.0) as u8);
                         bmp_bytes.push((g + bg_g * (1.0 - af)).clamp(0.0, 255.0) as u8);
                         bmp_bytes.push((r + bg_r * (1.0 - af)).clamp(0.0, 255.0) as u8);

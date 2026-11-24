@@ -15,6 +15,7 @@ pub const CMD_NEW_FAVORITES_PORTAL: u32 = 1002;
 pub const CMD_NEW_INSTALLED_PORTAL: u32 = 1003;
 pub const CMD_NEW_STEAM_PORTAL: u32 = 1004;
 pub const CMD_NEW_CUSTOM_PORTAL: u32 = 1005;
+pub const CMD_NEW_STATS_PORTAL: u32 = 1011;
 pub const CMD_RESCAN_LIBRARY: u32 = 1006;
 pub const CMD_TOGGLE_FRONT: u32 = 1007;
 pub const CMD_TOGGLE_STARTUP: u32 = 1008;
@@ -74,6 +75,7 @@ impl TrayIcon {
                 "Nuevo portal: Colección manual",
                 None,
             );
+            add_item(CMD_NEW_STATS_PORTAL, "Nuevo portal: Estadísticas", None);
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             add_item(CMD_RESCAN_LIBRARY, "Actualizar juegos y carátulas", None);
             add_item(

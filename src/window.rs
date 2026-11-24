@@ -1,4 +1,4 @@
-use crate::config::{PortalConfig, PortalKind, SortBy};
+use crate::config::{LayoutStyle, PortalConfig, PortalKind, SortBy};
 use crate::desktop_pin::desktop_insert_after;
 use crate::dnd::PortalDropTarget;
 use crate::library::{GameEntry, GameLibrary};
@@ -18,10 +18,8 @@ use std::time::Instant;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMSBT_TRANSIENTWINDOW,
-    DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_DISALLOW_PEEK, DWMWA_EXCLUDED_FROM_PEEK,
-    DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
-    DWMWCP_ROUND,
+    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_DISALLOW_PEEK,
+    DWMWA_EXCLUDED_FROM_PEEK, DWMWA_USE_IMMERSIVE_DARK_MODE,
 };
 use windows::Win32::System::Ole::{IDropTarget, RegisterDragDrop, RevokeDragDrop};
 use windows::Win32::UI::Controls::MARGINS;
@@ -60,7 +58,10 @@ const CTX_KIND_FAVORITES: u32 = 2008;
 const CTX_KIND_INSTALLED: u32 = 2009;
 const CTX_KIND_STEAM: u32 = 2010;
 const CTX_KIND_EPIC: u32 = 2011;
-const CTX_CLOSE_PORTAL: u32 = 2012;
+const CTX_KIND_STATS: u32 = 2012;
+const CTX_STYLE_CARDS: u32 = 2013;
+const CTX_STYLE_LIST: u32 = 2014;
+const CTX_CLOSE_PORTAL: u32 = 2015;
 
 static BRING_TO_FRONT: AtomicBool = AtomicBool::new(false);
 
@@ -144,11 +145,14 @@ impl PortalWindow {
         let games = library
             .borrow()
             .games_for_portal(&config.kind, config.sort_by);
+        let is_stats = matches!(config.kind, PortalKind::Stats);
         let layout = GameGridLayout::compute(
             config.width as f32,
             config.expanded_height as f32,
             games.len(),
             config.show_details,
+            config.layout_style,
+            is_stats,
         );
         let selected_index = if games.is_empty() { None } else { Some(0) };
 
@@ -216,8 +220,8 @@ impl PortalWindow {
 
             {
                 let mut s = state.borrow_mut();
-                s.config.theme.corner_radius = 8.0;
-                match PortalRenderer::new(hwnd, pw, ph, dpi, 8.0) {
+                let radius = s.config.theme.corner_radius;
+                match PortalRenderer::new(hwnd, pw, ph, dpi, radius) {
                     Ok(r) => s.renderer = Some(r),
                     Err(err) => log_diag(&format!("PortalRenderer::new failed: {err:?}")),
                 }
@@ -257,11 +261,14 @@ impl PortalWindow {
     }
 
     fn recompute_layout(&mut self) {
+        let is_stats = matches!(self.config.kind, PortalKind::Stats);
         self.layout = GameGridLayout::compute(
             self.config.width as f32,
             self.config.expanded_height as f32,
             self.games.len(),
             self.config.show_details,
+            self.config.layout_style,
+            is_stats,
         );
         self.scroll_y = self.scroll_y.clamp(0.0, self.layout.max_scroll);
     }
@@ -330,10 +337,12 @@ impl PortalWindow {
 
     pub fn draw(&mut self) {
         let (w_dip, h_dip) = self.current_dip_size();
+        let total_library_secs = self.library.borrow().total_playtime_secs();
         if let Some(renderer) = &mut self.renderer {
             let state = RenderState {
                 title: &self.config.title,
                 games: &self.games,
+                total_library_secs,
                 layout: &self.layout,
                 width: w_dip,
                 height: h_dip,
@@ -490,27 +499,6 @@ unsafe fn setup_dwm_attributes(hwnd: HWND) {
         &dark as *const _ as *const c_void,
         std::mem::size_of::<i32>() as u32,
     );
-    let backdrop = DWMSBT_TRANSIENTWINDOW;
-    let _ = DwmSetWindowAttribute(
-        hwnd,
-        DWMWA_SYSTEMBACKDROP_TYPE,
-        &backdrop as *const _ as *const c_void,
-        std::mem::size_of_val(&backdrop) as u32,
-    );
-    let corner = DWMWCP_ROUND;
-    let _ = DwmSetWindowAttribute(
-        hwnd,
-        DWMWA_WINDOW_CORNER_PREFERENCE,
-        &corner as *const _ as *const c_void,
-        std::mem::size_of_val(&corner) as u32,
-    );
-    let no_border = DWMWA_COLOR_NONE;
-    let _ = DwmSetWindowAttribute(
-        hwnd,
-        DWMWA_BORDER_COLOR,
-        &no_border as *const _ as *const c_void,
-        std::mem::size_of_val(&no_border) as u32,
-    );
     let yes: i32 = 1;
     let _ = DwmSetWindowAttribute(
         hwnd,
@@ -524,6 +512,8 @@ unsafe fn setup_dwm_attributes(hwnd: HWND) {
         &yes as *const _ as *const c_void,
         std::mem::size_of::<i32>() as u32,
     );
+    // Keep client area transparent for DirectComposition 18px rounded clipping without
+    // forcing Win11's 8px DWM backdrop box around our custom rounded corners.
     let margins = MARGINS {
         cxLeftWidth: -1,
         cxRightWidth: -1,
@@ -861,21 +851,28 @@ unsafe extern "system" fn portal_wnd_proc(
                         .layout
                         .hit_test(x_dip, y_dip, portal.games.len(), portal.scroll_y)
                     {
-                        Some(HitTarget::CardPlayButton(idx)) => {
+                        Some(HitTarget::CardPlayButton(idx))
+                        | Some(HitTarget::StatsTopGame(idx)) => {
                             portal.selected_index = Some(idx);
                             portal.launch_game_at(idx);
                             portal.draw();
+                        }
+                        Some(HitTarget::CardFavButton(idx)) => {
+                            if let Some(game_id) = portal.games.get(idx).map(|g| g.id.clone()) {
+                                portal.library.borrow_mut().toggle_favorite(&game_id);
+                                portal.notify_library_updated();
+                            }
                         }
                         Some(HitTarget::Card(idx)) => {
                             portal.selected_index = Some(idx);
                             portal.draw();
                         }
-                        Some(HitTarget::DetailsPlayButton) => {
+                        Some(HitTarget::HeroPlayButton) => {
                             if let Some(idx) = portal.selected_index {
                                 portal.launch_game_at(idx);
                             }
                         }
-                        Some(HitTarget::DetailsFavButton) => {
+                        Some(HitTarget::HeroFavButton) => {
                             if let Some(idx) = portal.selected_index {
                                 if let Some(game_id) = portal.games.get(idx).map(|g| g.id.clone()) {
                                     portal.library.borrow_mut().toggle_favorite(&game_id);
@@ -932,20 +929,36 @@ unsafe extern "system" fn portal_wnd_proc(
             LRESULT(0)
         }
         WM_RBUTTONUP => {
-            let (collapsed, auto_collapse, show_details, sort_by, kind, controller_hwnd) = {
+            let (
+                collapsed,
+                auto_collapse,
+                show_details,
+                sort_by,
+                layout_style,
+                kind,
+                controller_hwnd,
+            ) = {
                 let p = rc_clone.borrow();
                 (
                     p.config.collapsed,
                     p.config.auto_collapse,
                     p.config.show_details,
                     p.config.sort_by,
+                    p.config.layout_style,
                     p.config.kind.clone(),
                     p.controller_hwnd,
                 )
             };
 
-            let cmd =
-                show_portal_menu(hwnd, collapsed, auto_collapse, show_details, sort_by, &kind);
+            let cmd = show_portal_menu(
+                hwnd,
+                collapsed,
+                auto_collapse,
+                show_details,
+                sort_by,
+                layout_style,
+                &kind,
+            );
             match cmd {
                 Some(CTX_TOGGLE_COLLAPSE) => {
                     rc_clone.borrow_mut().set_collapsed(!collapsed);
@@ -959,6 +972,20 @@ unsafe extern "system" fn portal_wnd_proc(
                 Some(CTX_TOGGLE_DETAILS) => {
                     let mut p = rc_clone.borrow_mut();
                     p.config.show_details = !p.config.show_details;
+                    p.recompute_layout();
+                    p.notify_config_dirty();
+                    p.draw();
+                }
+                Some(CTX_STYLE_CARDS) => {
+                    let mut p = rc_clone.borrow_mut();
+                    p.config.layout_style = LayoutStyle::Cards;
+                    p.recompute_layout();
+                    p.notify_config_dirty();
+                    p.draw();
+                }
+                Some(CTX_STYLE_LIST) => {
+                    let mut p = rc_clone.borrow_mut();
+                    p.config.layout_style = LayoutStyle::CompactList;
                     p.recompute_layout();
                     p.notify_config_dirty();
                     p.draw();
@@ -1020,6 +1047,14 @@ unsafe extern "system" fn portal_wnd_proc(
                     p.refresh_from_library();
                     p.notify_config_dirty();
                 }
+                Some(CTX_KIND_STATS) => {
+                    let mut p = rc_clone.borrow_mut();
+                    p.config.kind = PortalKind::Stats;
+                    p.config.title = "Tus Estadísticas".into();
+                    p.recompute_layout();
+                    p.refresh_from_library();
+                    p.notify_config_dirty();
+                }
                 Some(CTX_CLOSE_PORTAL) => {
                     let _ = PostMessageW(
                         Some(controller_hwnd),
@@ -1077,6 +1112,7 @@ unsafe fn show_portal_menu(
     auto_collapse: bool,
     show_details: bool,
     sort_by: SortBy,
+    layout_style: LayoutStyle,
     kind: &PortalKind,
 ) -> Option<u32> {
     let Ok(menu) = CreatePopupMenu() else {
@@ -1108,8 +1144,19 @@ unsafe fn show_portal_menu(
     );
     add_item(
         CTX_TOGGLE_DETAILS,
-        "Panel de detalles Playnite",
+        "Mostrar tarjeta destacada (Hero)",
         Some(show_details),
+    );
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    add_item(
+        CTX_STYLE_CARDS,
+        "Vista: Tarjetas",
+        Some(layout_style == LayoutStyle::Cards),
+    );
+    add_item(
+        CTX_STYLE_LIST,
+        "Vista: Lista compacta",
+        Some(layout_style == LayoutStyle::CompactList),
     );
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     add_item(
@@ -1152,6 +1199,11 @@ unsafe fn show_portal_menu(
         CTX_KIND_EPIC,
         "Filtro: Epic Games",
         Some(matches!(kind, PortalKind::Launcher { name } if name.eq_ignore_ascii_case("Epic"))),
+    );
+    add_item(
+        CTX_KIND_STATS,
+        "Filtro: Estadísticas",
+        Some(matches!(kind, PortalKind::Stats)),
     );
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     add_item(CTX_CLOSE_PORTAL, "Eliminar portal", None);
