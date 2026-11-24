@@ -30,10 +30,6 @@ impl IconCache {
         }
     }
 
-    pub fn clear(&mut self) {
-        self.bitmaps.clear();
-    }
-
     pub fn get_or_load(
         &mut self,
         ctx: &ID2D1DeviceContext,

@@ -10,12 +10,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD,
 };
 
-pub const CMD_NEW_FOLDER_PORTAL: u32 = 1001;
-pub const CMD_NEW_VIRTUAL_PORTAL: u32 = 1002;
-pub const CMD_TOGGLE_FRONT: u32 = 1003;
-pub const CMD_TOGGLE_STARTUP: u32 = 1004;
-pub const CMD_OPEN_CONFIG_DIR: u32 = 1005;
-pub const CMD_EXIT: u32 = 1006;
+pub const CMD_NEW_RECENT_PORTAL: u32 = 1001;
+pub const CMD_NEW_FAVORITES_PORTAL: u32 = 1002;
+pub const CMD_NEW_INSTALLED_PORTAL: u32 = 1003;
+pub const CMD_NEW_STEAM_PORTAL: u32 = 1004;
+pub const CMD_NEW_CUSTOM_PORTAL: u32 = 1005;
+pub const CMD_RESCAN_LIBRARY: u32 = 1006;
+pub const CMD_TOGGLE_FRONT: u32 = 1007;
+pub const CMD_TOGGLE_STARTUP: u32 = 1008;
+pub const CMD_OPEN_CONFIG_DIR: u32 = 1009;
+pub const CMD_EXIT: u32 = 1010;
 
 pub struct TrayIcon {
     hwnd: HWND,
@@ -34,7 +38,7 @@ impl TrayIcon {
             ..Default::default()
         };
 
-        let tip = to_wide_null("OpenDesktopDoors — Ctrl+Alt+D");
+        let tip = to_wide_null("OpenDesktopDoors — Playnite Portals (Ctrl+Alt+D)");
         let len = tip.len().min(nid.szTip.len());
         nid.szTip[..len].copy_from_slice(&tip[..len]);
 
@@ -61,22 +65,30 @@ impl TrayIcon {
                 let _ = AppendMenuW(menu, flags, id as usize, PCWSTR(wide.as_ptr()));
             };
 
-            add_item(CMD_NEW_FOLDER_PORTAL, "New Folder Portal...", None);
-            add_item(CMD_NEW_VIRTUAL_PORTAL, "New Quick Doors Portal", None);
+            add_item(CMD_NEW_RECENT_PORTAL, "Nuevo portal: Recientes", None);
+            add_item(CMD_NEW_FAVORITES_PORTAL, "Nuevo portal: Favoritos", None);
+            add_item(CMD_NEW_INSTALLED_PORTAL, "Nuevo portal: Instalados", None);
+            add_item(CMD_NEW_STEAM_PORTAL, "Nuevo portal: Steam", None);
+            add_item(
+                CMD_NEW_CUSTOM_PORTAL,
+                "Nuevo portal: Colección manual",
+                None,
+            );
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            add_item(CMD_RESCAN_LIBRARY, "Actualizar juegos y carátulas", None);
             add_item(
                 CMD_TOGGLE_FRONT,
-                "Bring Portals to Front (Ctrl+Alt+D)",
+                "Traer portales al frente (Ctrl+Alt+D)",
                 Some(brought_to_front),
             );
             add_item(
                 CMD_TOGGLE_STARTUP,
-                "Start with Windows",
+                "Iniciar con Windows",
                 Some(startup_enabled),
             );
-            add_item(CMD_OPEN_CONFIG_DIR, "Open Config Folder", None);
+            add_item(CMD_OPEN_CONFIG_DIR, "Abrir carpeta de configuración", None);
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-            add_item(CMD_EXIT, "Exit OpenDesktopDoors", None);
+            add_item(CMD_EXIT, "Salir de OpenDesktopDoors", None);
 
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);

@@ -1,156 +1,182 @@
-use crate::config::PortalKind;
-use std::cmp::Ordering;
-use std::fs;
-use std::path::{Path, PathBuf};
-
 pub const HEADER_HEIGHT: f32 = 44.0;
 pub const GRID_PADDING_X: f32 = 14.0;
-pub const GRID_PADDING_TOP: f32 = 10.0;
+pub const GRID_PADDING_TOP: f32 = 12.0;
 pub const GRID_PADDING_BOTTOM: f32 = 14.0;
-pub const CELL_WIDTH: f32 = 82.0;
-pub const CELL_HEIGHT: f32 = 90.0;
-pub const CELL_GAP: f32 = 8.0;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PortalItem {
-    pub name: String,
-    pub path: PathBuf,
-    pub is_dir: bool,
-}
+// Playnite 2:3 vertical box-art card geometry
+pub const CARD_WIDTH: f32 = 104.0;
+pub const COVER_HEIGHT: f32 = 156.0; // 2:3 ratio
+pub const CARD_HEIGHT: f32 = 188.0; // cover + title/meta strip
+pub const CARD_GAP: f32 = 12.0;
+pub const DETAILS_PANEL_HEIGHT: f32 = 132.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ItemRect {
+pub struct RectF {
     pub left: f32,
     pub top: f32,
     pub right: f32,
     pub bottom: f32,
 }
 
-impl ItemRect {
+impl RectF {
     pub fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.left && x <= self.right && y >= self.top && y <= self.bottom
     }
+
+    pub fn width(&self) -> f32 {
+        self.right - self.left
+    }
+
+    pub fn height(&self) -> f32 {
+        self.bottom - self.top
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitTarget {
+    Card(usize),
+    CardPlayButton(usize),
+    DetailsPlayButton,
+    DetailsFavButton,
 }
 
 #[derive(Debug, Clone)]
-pub struct GridLayout {
+pub struct GameGridLayout {
     pub columns: usize,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub rows: usize,
     pub total_content_height: f32,
     pub max_scroll: f32,
     pub origin_x: f32,
+    pub grid_bottom: f32,
+    pub details_rect: Option<RectF>,
+    pub details_play_rect: Option<RectF>,
+    pub details_fav_rect: Option<RectF>,
 }
 
-impl GridLayout {
-    pub fn compute(width: f32, height: f32, item_count: usize) -> Self {
-        let usable_w = (width - GRID_PADDING_X * 2.0).max(CELL_WIDTH);
-        let columns = (((usable_w + CELL_GAP) / (CELL_WIDTH + CELL_GAP)).floor() as usize).max(1);
+impl GameGridLayout {
+    pub fn compute(width: f32, height: f32, item_count: usize, show_details: bool) -> Self {
+        let has_details =
+            show_details && item_count > 0 && height > HEADER_HEIGHT + DETAILS_PANEL_HEIGHT + 80.0;
+        let grid_bottom = if has_details {
+            height - DETAILS_PANEL_HEIGHT
+        } else {
+            height
+        };
+
+        let usable_w = (width - GRID_PADDING_X * 2.0).max(CARD_WIDTH);
+        let columns = (((usable_w + CARD_GAP) / (CARD_WIDTH + CARD_GAP)).floor() as usize).max(1);
         let rows = if item_count == 0 {
             0
         } else {
             item_count.div_ceil(columns)
         };
 
-        let grid_w = columns as f32 * CELL_WIDTH + (columns.saturating_sub(1)) as f32 * CELL_GAP;
+        let grid_w = columns as f32 * CARD_WIDTH + (columns.saturating_sub(1)) as f32 * CARD_GAP;
         let origin_x = ((width - grid_w) * 0.5).max(GRID_PADDING_X);
 
         let content_h = if rows == 0 {
             0.0
         } else {
             GRID_PADDING_TOP
-                + rows as f32 * CELL_HEIGHT
-                + (rows.saturating_sub(1)) as f32 * CELL_GAP
+                + rows as f32 * CARD_HEIGHT
+                + (rows.saturating_sub(1)) as f32 * CARD_GAP
                 + GRID_PADDING_BOTTOM
         };
 
-        let viewport_h = (height - HEADER_HEIGHT).max(0.0);
+        let viewport_h = (grid_bottom - HEADER_HEIGHT).max(0.0);
         let max_scroll = (content_h - viewport_h).max(0.0);
+
+        let (details_rect, details_play_rect, details_fav_rect) = if has_details {
+            let dr = RectF {
+                left: 0.0,
+                top: grid_bottom,
+                right: width,
+                bottom: height,
+            };
+            let play_btn = RectF {
+                left: width - 118.0,
+                top: height - 48.0,
+                right: width - 16.0,
+                bottom: height - 14.0,
+            };
+            let fav_btn = RectF {
+                left: width - 160.0,
+                top: height - 48.0,
+                right: width - 126.0,
+                bottom: height - 14.0,
+            };
+            (Some(dr), Some(play_btn), Some(fav_btn))
+        } else {
+            (None, None, None)
+        };
 
         Self {
             columns,
-            rows,
             total_content_height: content_h,
             max_scroll,
             origin_x,
+            grid_bottom,
+            details_rect,
+            details_play_rect,
+            details_fav_rect,
         }
     }
 
-    pub fn item_rect(&self, index: usize, scroll_y: f32) -> ItemRect {
+    pub fn card_rect(&self, index: usize, scroll_y: f32) -> RectF {
         let col = index % self.columns;
         let row = index / self.columns;
-        let left = self.origin_x + col as f32 * (CELL_WIDTH + CELL_GAP);
+        let left = self.origin_x + col as f32 * (CARD_WIDTH + CARD_GAP);
         let top =
-            HEADER_HEIGHT + GRID_PADDING_TOP + row as f32 * (CELL_HEIGHT + CELL_GAP) - scroll_y;
-        ItemRect {
+            HEADER_HEIGHT + GRID_PADDING_TOP + row as f32 * (CARD_HEIGHT + CARD_GAP) - scroll_y;
+        RectF {
             left,
             top,
-            right: left + CELL_WIDTH,
-            bottom: top + CELL_HEIGHT,
+            right: left + CARD_WIDTH,
+            bottom: top + CARD_HEIGHT,
         }
     }
 
-    pub fn hit_test(&self, x: f32, y: f32, item_count: usize, scroll_y: f32) -> Option<usize> {
-        if y < HEADER_HEIGHT {
+    pub fn cover_rect(&self, index: usize, scroll_y: f32) -> RectF {
+        let c = self.card_rect(index, scroll_y);
+        RectF {
+            left: c.left,
+            top: c.top,
+            right: c.right,
+            bottom: c.top + COVER_HEIGHT,
+        }
+    }
+
+    pub fn card_play_circle_contains(&self, index: usize, scroll_y: f32, x: f32, y: f32) -> bool {
+        let cov = self.cover_rect(index, scroll_y);
+        let cx = cov.left + cov.width() * 0.5;
+        let cy = cov.top + cov.height() * 0.5;
+        let dx = x - cx;
+        let dy = y - cy;
+        (dx * dx + dy * dy) <= (22.0 * 22.0)
+    }
+
+    pub fn hit_test(&self, x: f32, y: f32, item_count: usize, scroll_y: f32) -> Option<HitTarget> {
+        if let Some(play_r) = self.details_play_rect {
+            if play_r.contains(x, y) {
+                return Some(HitTarget::DetailsPlayButton);
+            }
+        }
+        if let Some(fav_r) = self.details_fav_rect {
+            if fav_r.contains(x, y) {
+                return Some(HitTarget::DetailsFavButton);
+            }
+        }
+        if y < HEADER_HEIGHT || y >= self.grid_bottom {
             return None;
         }
-        (0..item_count).find(|&idx| self.item_rect(idx, scroll_y).contains(x, y))
-    }
-}
-
-pub fn load_items(kind: &PortalKind) -> Vec<PortalItem> {
-    match kind {
-        PortalKind::Folder { path } => load_folder_items(path),
-        PortalKind::Virtual { items } => items
-            .iter()
-            .map(|v| PortalItem {
-                name: v.name.clone(),
-                path: v.target.clone(),
-                is_dir: v.target.is_dir(),
-            })
-            .collect(),
-    }
-}
-
-pub fn load_folder_items(dir: &Path) -> Vec<PortalItem> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-
-    let mut items = Vec::new();
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let name_str = file_name.to_string_lossy();
-        if should_skip_filename(&name_str) {
-            continue;
+        for idx in 0..item_count {
+            if self.card_rect(idx, scroll_y).contains(x, y) {
+                if self.card_play_circle_contains(idx, scroll_y, x, y) {
+                    return Some(HitTarget::CardPlayButton(idx));
+                }
+                return Some(HitTarget::Card(idx));
+            }
         }
-        let path = entry.path();
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let display_name = strip_lnk_extension(&name_str, is_dir);
-        items.push(PortalItem {
-            name: display_name,
-            path,
-            is_dir,
-        });
-    }
-
-    items.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-        (true, false) => Ordering::Less,
-        (false, true) => Ordering::Greater,
-        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-    });
-    items
-}
-
-fn should_skip_filename(name: &str) -> bool {
-    name.eq_ignore_ascii_case("desktop.ini") || name.eq_ignore_ascii_case("thumbs.db")
-}
-
-fn strip_lnk_extension(name: &str, is_dir: bool) -> String {
-    if !is_dir && name.to_lowercase().ends_with(".lnk") && name.len() > 4 {
-        name[..name.len() - 4].to_string()
-    } else {
-        name.to_string()
+        None
     }
 }
 
@@ -159,23 +185,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn grid_layout_computes_columns_and_hit_tests() {
-        let layout = GridLayout::compute(340.0, 360.0, 7);
-        assert_eq!(layout.columns, 3);
-        assert_eq!(layout.rows, 3);
+    fn computes_2_to_3_cover_grid_and_details_panel_hits() {
+        let layout = GameGridLayout::compute(520.0, 440.0, 8, true);
+        assert!(layout.columns >= 4);
+        assert!(layout.details_rect.is_some());
 
-        let r0 = layout.item_rect(0, 0.0);
-        let cx = (r0.left + r0.right) * 0.5;
-        let cy = (r0.top + r0.bottom) * 0.5;
-        assert_eq!(layout.hit_test(cx, cy, 7, 0.0), Some(0));
-        assert_eq!(layout.hit_test(cx, 10.0, 7, 0.0), None); // in header
-    }
+        let c0 = layout.cover_rect(0, 0.0);
+        let cx = (c0.left + c0.right) * 0.5;
+        let cy = (c0.top + c0.bottom) * 0.5;
+        assert_eq!(
+            layout.hit_test(cx, cy, 8, 0.0),
+            Some(HitTarget::CardPlayButton(0))
+        );
+        assert_eq!(
+            layout.hit_test(c0.left + 4.0, c0.top + 4.0, 8, 0.0),
+            Some(HitTarget::Card(0))
+        );
 
-    #[test]
-    fn skips_desktop_ini_and_strips_lnk() {
-        assert!(should_skip_filename("desktop.ini"));
-        assert!(!should_skip_filename("notes.txt"));
-        assert_eq!(strip_lnk_extension("Firefox.lnk", false), "Firefox");
-        assert_eq!(strip_lnk_extension("folder.lnk", true), "folder.lnk");
+        let dp = layout.details_play_rect.unwrap();
+        assert_eq!(
+            layout.hit_test(dp.left + 10.0, dp.top + 10.0, 8, 0.0),
+            Some(HitTarget::DetailsPlayButton)
+        );
     }
 }

@@ -1,22 +1,17 @@
-use crate::messages::{to_wide_null, WM_APP_DROP_PATHS};
+use crate::messages::WM_APP_DROP_PATHS;
 use std::cell::Cell;
-use std::path::{Path, PathBuf};
-use windows::core::{implement, BOOL, HRESULT, PCWSTR};
-use windows::Win32::Foundation::{
-    DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, HWND, LPARAM, POINTL, S_OK,
-    WPARAM,
-};
+use std::path::PathBuf;
+use windows::core::implement;
+use windows::Win32::Foundation::{HWND, LPARAM, POINTL, WPARAM};
 use windows::Win32::System::Com::{
     IDataObject, DVASPECT_CONTENT, FORMATETC, STGMEDIUM, TYMED_HGLOBAL,
 };
 use windows::Win32::System::Ole::{
-    DoDragDrop, IDropSource, IDropSource_Impl, IDropTarget, IDropTarget_Impl, CF_HDROP, DROPEFFECT,
-    DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE,
+    IDropTarget, IDropTarget_Impl, CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE,
+    DROPEFFECT_NONE,
 };
-use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
-use windows::Win32::UI::Shell::{
-    BHID_DataObject, DragQueryFileW, IShellItem, SHCreateItemFromParsingName, HDROP,
-};
+use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
+use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 #[implement(IDropTarget)]
@@ -182,103 +177,5 @@ fn choose_effect(mods: MODIFIERKEYS_FLAGS) -> DROPEFFECT {
         DROPEFFECT_MOVE
     } else {
         DROPEFFECT_COPY
-    }
-}
-
-#[implement(IDropSource)]
-struct PortalDropSource;
-
-impl IDropSource_Impl for PortalDropSource_Impl {
-    fn QueryContinueDrag(&self, fescapepressed: BOOL, grfkeystate: MODIFIERKEYS_FLAGS) -> HRESULT {
-        if fescapepressed.as_bool() {
-            return DRAGDROP_S_CANCEL;
-        }
-        if (grfkeystate.0 & MK_LBUTTON.0) == 0 {
-            return DRAGDROP_S_DROP;
-        }
-        S_OK
-    }
-
-    fn GiveFeedback(&self, _dweffect: DROPEFFECT) -> HRESULT {
-        DRAGDROP_S_USEDEFAULTCURSORS
-    }
-}
-
-pub fn start_file_drag(path: &Path) {
-    let wide = to_wide_null(&path.to_string_lossy());
-    unsafe {
-        let Ok(item): windows::core::Result<IShellItem> =
-            SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None)
-        else {
-            return;
-        };
-        let Ok(data_obj): windows::core::Result<IDataObject> =
-            item.BindToHandler(None, &BHID_DataObject)
-        else {
-            return;
-        };
-        let drop_source: IDropSource = PortalDropSource.into();
-        let mut out_effect = DROPEFFECT_NONE;
-        let _ = DoDragDrop(
-            &data_obj,
-            &drop_source,
-            DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK,
-            &mut out_effect,
-        );
-    }
-}
-
-pub fn copy_or_move_into_folder(paths: &[PathBuf], dest_dir: &Path, move_files: bool) {
-    for src in paths {
-        let Some(name) = src.file_name() else {
-            continue;
-        };
-        let mut dst = dest_dir.join(name);
-        if src == &dst {
-            continue;
-        }
-        if dst.exists() {
-            let stem = src
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Item".into());
-            let ext = src
-                .extension()
-                .map(|e| format!(".{}", e.to_string_lossy()))
-                .unwrap_or_default();
-            for n in 2..=99 {
-                let candidate = dest_dir.join(format!("{stem} ({n}){ext}"));
-                if !candidate.exists() {
-                    dst = candidate;
-                    break;
-                }
-            }
-        }
-        if move_files {
-            let _ = std::fs::rename(src, &dst).or_else(|_| {
-                copy_recursive(src, &dst)?;
-                if src.is_dir() {
-                    std::fs::remove_dir_all(src)
-                } else {
-                    std::fs::remove_file(src)
-                }
-            });
-        } else {
-            let _ = copy_recursive(src, &dst);
-        }
-    }
-}
-
-fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
-    if src.is_dir() {
-        std::fs::create_dir_all(dst)?;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            copy_recursive(&entry.path(), &dst.join(entry.file_name()))?;
-        }
-        Ok(())
-    } else {
-        std::fs::copy(src, dst)?;
-        Ok(())
     }
 }

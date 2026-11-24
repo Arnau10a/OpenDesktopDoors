@@ -1,12 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+mod covers;
 mod desktop_pin;
 mod dnd;
-mod fs_watch;
 mod hotkey;
 mod icons;
+mod launchers;
+mod library;
 mod messages;
+mod playnite_db;
 mod portal;
 mod render;
 mod spring;
@@ -14,22 +17,25 @@ mod startup;
 mod tray;
 mod window;
 
-use config::{AppConfig, PortalConfig, PortalKind, PortalTheme};
+use config::{AppConfig, PortalConfig, PortalKind, PortalTheme, SortBy};
+use covers::{spawn_missing_cover_fetcher, PendingCovers};
 use desktop_pin::DesktopPinGuard;
 use hotkey::{GlobalHotkey, HOTKEY_TOGGLE_FRONT_ID};
+use library::GameLibrary;
 use messages::{
-    to_wide_null, WM_APP_CONFIG_DIRTY, WM_APP_PORTAL_CLOSED, WM_APP_TRAY, WM_APP_WIN_D_GUARD,
+    to_wide_null, WM_APP_CONFIG_DIRTY, WM_APP_COVER_READY, WM_APP_LIBRARY_UPDATED,
+    WM_APP_PORTAL_CLOSED, WM_APP_TRAY, WM_APP_WIN_D_GUARD,
 };
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use tray::{
-    TrayIcon, CMD_EXIT, CMD_NEW_FOLDER_PORTAL, CMD_NEW_VIRTUAL_PORTAL, CMD_OPEN_CONFIG_DIR,
+    TrayIcon, CMD_EXIT, CMD_NEW_CUSTOM_PORTAL, CMD_NEW_FAVORITES_PORTAL, CMD_NEW_INSTALLED_PORTAL,
+    CMD_NEW_RECENT_PORTAL, CMD_NEW_STEAM_PORTAL, CMD_OPEN_CONFIG_DIR, CMD_RESCAN_LIBRARY,
     CMD_TOGGLE_FRONT, CMD_TOGGLE_STARTUP,
 };
-use window::{
-    apply_z_order_hwnd, is_bring_to_front, pick_folder_dialog, set_bring_to_front, PortalWindow,
-};
+use window::{apply_z_order_hwnd, is_bring_to_front, set_bring_to_front, PortalWindow};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
@@ -56,6 +62,8 @@ struct AppState {
     hwnd: HWND,
     hinstance: windows::Win32::Foundation::HINSTANCE,
     config: AppConfig,
+    library: Rc<RefCell<GameLibrary>>,
+    pending_covers: PendingCovers,
     portals: Vec<Rc<RefCell<PortalWindow>>>,
     tray: Option<TrayIcon>,
     _hotkey: Option<GlobalHotkey>,
@@ -76,45 +84,31 @@ impl AppState {
         self.portals.iter().map(|p| p.borrow().hwnd).collect()
     }
 
-    fn add_folder_portal(&mut self, folder: std::path::PathBuf) {
-        let title = folder
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Folder".to_string());
-        let offset = (self.portals.len() as i32) * 32;
-        let cfg = PortalConfig {
-            id: format!("portal-{}", self.portals.len() + 1),
-            title,
-            kind: PortalKind::Folder { path: folder },
-            x: 80 + offset,
-            y: 80 + offset,
-            width: 340,
-            expanded_height: 360,
-            collapsed: false,
-            auto_collapse: false,
-            theme: PortalTheme::default(),
-        };
-        if let Some(win) = PortalWindow::spawn(self.hinstance, self.hwnd, cfg) {
-            self.portals.push(win);
-            self.save_current_config();
+    fn refresh_all_portals(&self) {
+        for p in &self.portals {
+            p.borrow_mut().refresh_from_library();
         }
     }
 
-    fn spawn_new_virtual_portal(&mut self) {
+    fn spawn_portal(&mut self, title: &str, kind: PortalKind, sort_by: SortBy) {
         let offset = (self.portals.len() as i32) * 32;
         let cfg = PortalConfig {
-            id: format!("portal-virtual-{}", self.portals.len() + 1),
-            title: "Quick Doors".to_string(),
-            kind: PortalKind::Virtual { items: Vec::new() },
-            x: 120 + offset,
-            y: 120 + offset,
-            width: 320,
-            expanded_height: 240,
+            id: format!("portal-{}", self.portals.len() + 1),
+            title: title.to_string(),
+            kind,
+            sort_by,
+            x: 64 + offset,
+            y: 64 + offset,
+            width: 480,
+            expanded_height: 440,
             collapsed: false,
-            auto_collapse: true,
+            auto_collapse: false,
+            show_details: true,
             theme: PortalTheme::default(),
         };
-        if let Some(win) = PortalWindow::spawn(self.hinstance, self.hwnd, cfg) {
+        if let Some(win) =
+            PortalWindow::spawn(self.hinstance, self.hwnd, Rc::clone(&self.library), cfg)
+        {
             self.portals.push(win);
             self.save_current_config();
         }
@@ -151,10 +145,15 @@ fn main() {
         RegisterClassExW(&wc);
 
         let cfg = config::load_or_default();
+        let library = Rc::new(RefCell::new(GameLibrary::load_and_scan()));
+        let pending_covers: PendingCovers = Arc::new(Mutex::new(Vec::new()));
+
         let app = Rc::new(RefCell::new(AppState {
             hwnd: HWND::default(),
             hinstance,
             config: cfg.clone(),
+            library: Rc::clone(&library),
+            pending_covers: Arc::clone(&pending_covers),
             portals: Vec::new(),
             tray: None,
             _hotkey: None,
@@ -194,11 +193,16 @@ fn main() {
             state._pin_guard = Some(DesktopPinGuard::install(ctrl_hwnd));
 
             for portal_cfg in cfg.portals {
-                if let Some(p) = PortalWindow::spawn(hinstance, ctrl_hwnd, portal_cfg) {
+                if let Some(p) =
+                    PortalWindow::spawn(hinstance, ctrl_hwnd, Rc::clone(&library), portal_cfg)
+                {
                     state.portals.push(p);
                 }
             }
         }
+
+        // Background fetch missing 2:3 Steam covers via WinHTTP
+        spawn_missing_cover_fetcher(&library.borrow().games, ctrl_hwnd, pending_covers);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -258,7 +262,6 @@ unsafe extern "system" fn controller_wnd_proc(
                 for h in hwnds {
                     apply_z_order_hwnd(h);
                 }
-                // Re-pin after Explorer finishes raising WorkerW during Win+D / Show Desktop click
                 let _ = SetTimer(Some(hwnd), TIMER_WIN_D_RECHECK_1, 60, None);
                 let _ = SetTimer(Some(hwnd), TIMER_WIN_D_RECHECK_2, 180, None);
             }
@@ -278,6 +281,38 @@ unsafe extern "system" fn controller_wnd_proc(
         }
         WM_APP_CONFIG_DIRTY => {
             rc_clone.borrow_mut().save_current_config();
+            LRESULT(0)
+        }
+        WM_APP_COVER_READY => {
+            let state = rc_clone.borrow();
+            let updates: Vec<_> = {
+                if let Ok(mut q) = state.pending_covers.lock() {
+                    std::mem::take(&mut *q)
+                } else {
+                    Vec::new()
+                }
+            };
+            if !updates.is_empty() {
+                let mut lib = state.library.borrow_mut();
+                for (gid, cov, hero) in updates {
+                    lib.apply_downloaded_cover(&gid, cov, hero);
+                }
+                drop(lib);
+                state.refresh_all_portals();
+            }
+            LRESULT(0)
+        }
+        WM_APP_LIBRARY_UPDATED => {
+            if wparam.0 == 1 && lparam.0 != 0 {
+                let boxed = Box::from_raw(lparam.0 as *mut (String, u64));
+                let (game_id, delta_secs) = *boxed;
+                rc_clone
+                    .borrow()
+                    .library
+                    .borrow_mut()
+                    .add_playtime(&game_id, delta_secs);
+            }
+            rc_clone.borrow().refresh_all_portals();
             LRESULT(0)
         }
         WM_APP_PORTAL_CLOSED => {
@@ -310,13 +345,54 @@ unsafe extern "system" fn controller_wnd_proc(
                         .and_then(|t| t.show_menu(is_bring_to_front(), startup_on))
                 };
                 match cmd {
-                    Some(CMD_NEW_FOLDER_PORTAL) => {
-                        if let Some(folder) = pick_folder_dialog(hwnd) {
-                            rc_clone.borrow_mut().add_folder_portal(folder);
-                        }
+                    Some(CMD_NEW_RECENT_PORTAL) => {
+                        rc_clone.borrow_mut().spawn_portal(
+                            "Jugados recientemente",
+                            PortalKind::Recent,
+                            SortBy::LastPlayed,
+                        );
                     }
-                    Some(CMD_NEW_VIRTUAL_PORTAL) => {
-                        rc_clone.borrow_mut().spawn_new_virtual_portal();
+                    Some(CMD_NEW_FAVORITES_PORTAL) => {
+                        rc_clone.borrow_mut().spawn_portal(
+                            "Favoritos",
+                            PortalKind::Favorites,
+                            SortBy::LastPlayed,
+                        );
+                    }
+                    Some(CMD_NEW_INSTALLED_PORTAL) => {
+                        rc_clone.borrow_mut().spawn_portal(
+                            "Instalados",
+                            PortalKind::Installed,
+                            SortBy::Playtime,
+                        );
+                    }
+                    Some(CMD_NEW_STEAM_PORTAL) => {
+                        rc_clone.borrow_mut().spawn_portal(
+                            "Steam",
+                            PortalKind::Launcher {
+                                name: "Steam".into(),
+                            },
+                            SortBy::LastPlayed,
+                        );
+                    }
+                    Some(CMD_NEW_CUSTOM_PORTAL) => {
+                        rc_clone.borrow_mut().spawn_portal(
+                            "Colección",
+                            PortalKind::Custom {
+                                game_ids: Vec::new(),
+                            },
+                            SortBy::Name,
+                        );
+                    }
+                    Some(CMD_RESCAN_LIBRARY) => {
+                        let state = rc_clone.borrow();
+                        state.library.borrow_mut().rescan();
+                        state.refresh_all_portals();
+                        spawn_missing_cover_fetcher(
+                            &state.library.borrow().games,
+                            hwnd,
+                            Arc::clone(&state.pending_covers),
+                        );
                     }
                     Some(CMD_TOGGLE_FRONT) => {
                         let hwnds = {
@@ -353,7 +429,6 @@ unsafe extern "system" fn controller_wnd_proc(
                             state.portals.clear();
                             hs
                         };
-                        let _ = window::hide_window;
                         for h in hwnds {
                             let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(h);
                         }

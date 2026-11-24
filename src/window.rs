@@ -1,11 +1,12 @@
-use crate::config::{PortalConfig, PortalKind, VirtualItem};
+use crate::config::{PortalConfig, PortalKind, SortBy};
 use crate::desktop_pin::desktop_insert_after;
-use crate::dnd::{copy_or_move_into_folder, start_file_drag, PortalDropTarget};
-use crate::fs_watch::FolderWatcher;
+use crate::dnd::PortalDropTarget;
+use crate::library::{GameEntry, GameLibrary};
 use crate::messages::{
-    to_wide_null, WM_APP_CONFIG_DIRTY, WM_APP_DROP_PATHS, WM_APP_FS_CHANGED, WM_APP_PORTAL_CLOSED,
+    to_wide_null, WM_APP_CONFIG_DIRTY, WM_APP_DROP_PATHS, WM_APP_LIBRARY_UPDATED,
+    WM_APP_PORTAL_CLOSED,
 };
-use crate::portal::{load_items, GridLayout, PortalItem, HEADER_HEIGHT};
+use crate::portal::{GameGridLayout, HitTarget, HEADER_HEIGHT};
 use crate::render::{rect_size, PortalRenderer, RenderState};
 use crate::spring::Spring;
 use std::cell::RefCell;
@@ -22,26 +23,23 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
     DWMWCP_ROUND,
 };
-use windows::Win32::System::Com::CLSCTX_INPROC_SERVER;
 use windows::Win32::System::Ole::{IDropTarget, RegisterDragDrop, RevokeDragDrop};
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
-use windows::Win32::UI::Shell::{
-    FileOpenDialog, IFileOpenDialog, ShellExecuteW, FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
-};
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW,
     PostMessageW, RegisterClassExW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     TrackPopupMenu, CS_DBLCLKS, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, IDC_SIZENWSE, MF_CHECKED,
     MF_SEPARATOR, MF_STRING, MF_UNCHECKED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN,
-    WINDOWPOS, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR,
-    WM_SIZE, WM_TIMER, WM_WINDOWPOSCHANGING, WNDCLASSEXW, WS_CLIPCHILDREN, WS_EX_NOACTIVATE,
+    SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, WINDOWPOS,
+    WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE,
+    WM_TIMER, WM_WINDOWPOSCHANGING, WNDCLASSEXW, WS_CLIPCHILDREN, WS_EX_NOACTIVATE,
     WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
@@ -53,9 +51,16 @@ const COLLAPSED_HEIGHT: f32 = HEADER_HEIGHT;
 
 const CTX_TOGGLE_COLLAPSE: u32 = 2001;
 const CTX_TOGGLE_AUTO_COLLAPSE: u32 = 2002;
-const CTX_OPEN_FOLDER: u32 = 2003;
-const CTX_CHANGE_FOLDER: u32 = 2004;
-const CTX_CLOSE_PORTAL: u32 = 2005;
+const CTX_TOGGLE_DETAILS: u32 = 2003;
+const CTX_SORT_LAST_PLAYED: u32 = 2004;
+const CTX_SORT_PLAYTIME: u32 = 2005;
+const CTX_SORT_NAME: u32 = 2006;
+const CTX_KIND_RECENT: u32 = 2007;
+const CTX_KIND_FAVORITES: u32 = 2008;
+const CTX_KIND_INSTALLED: u32 = 2009;
+const CTX_KIND_STEAM: u32 = 2010;
+const CTX_KIND_EPIC: u32 = 2011;
+const CTX_CLOSE_PORTAL: u32 = 2012;
 
 static BRING_TO_FRONT: AtomicBool = AtomicBool::new(false);
 
@@ -83,27 +88,23 @@ enum DragMode {
         start_w: i32,
         start_h: i32,
     },
-    PendingItemDrag {
-        index: usize,
-        start_x: f32,
-        start_y: f32,
-    },
 }
 
 pub struct PortalWindow {
     pub hwnd: HWND,
     pub config: PortalConfig,
     controller_hwnd: HWND,
-    items: Vec<PortalItem>,
-    layout: GridLayout,
+    library: Rc<RefCell<GameLibrary>>,
+    games: Vec<GameEntry>,
+    layout: GameGridLayout,
     renderer: Option<PortalRenderer>,
-    watcher: Option<FolderWatcher>,
     _drop_target: Option<IDropTarget>,
     height_spring: Spring,
     last_tick: Instant,
     animating: bool,
     scroll_y: f32,
-    hovered_index: Option<usize>,
+    hovered: Option<HitTarget>,
+    selected_index: Option<usize>,
     mouse_inside: bool,
     is_drag_over: bool,
     drag_mode: DragMode,
@@ -130,6 +131,7 @@ impl PortalWindow {
     pub fn spawn(
         hinstance: HINSTANCE,
         controller_hwnd: HWND,
+        library: Rc<RefCell<GameLibrary>>,
         mut config: PortalConfig,
     ) -> Option<Rc<RefCell<Self>>> {
         config.clamp_dimensions();
@@ -139,27 +141,32 @@ impl PortalWindow {
             config.expanded_height
         };
 
-        let items = load_items(&config.kind);
-        let layout = GridLayout::compute(
+        let games = library
+            .borrow()
+            .games_for_portal(&config.kind, config.sort_by);
+        let layout = GameGridLayout::compute(
             config.width as f32,
             config.expanded_height as f32,
-            items.len(),
+            games.len(),
+            config.show_details,
         );
+        let selected_index = if games.is_empty() { None } else { Some(0) };
 
         let state = Rc::new(RefCell::new(Self {
             hwnd: HWND::default(),
             height_spring: Spring::new(initial_h as f32, 300.0, 32.0),
             config: config.clone(),
             controller_hwnd,
-            items,
+            library,
+            games,
             layout,
             renderer: None,
-            watcher: None,
             _drop_target: None,
             last_tick: Instant::now(),
             animating: false,
             scroll_y: 0.0,
-            hovered_index: None,
+            hovered: None,
+            selected_index,
             mouse_inside: false,
             is_drag_over: false,
             drag_mode: DragMode::None,
@@ -205,19 +212,15 @@ impl PortalWindow {
                 (pw, ph, s.dpi)
             };
 
-            // Win32/DWM calls happen with NO RefCell borrow held to avoid re-entrancy panics.
             setup_dwm_attributes(hwnd);
 
             {
                 let mut s = state.borrow_mut();
-                // Align card corner radius with Windows 11 DWMWCP_ROUND (8 DIPs) so Acrylic
-                // backdrop and Direct2D glass border match 1:1 with zero corner artifacts.
                 s.config.theme.corner_radius = 8.0;
                 match PortalRenderer::new(hwnd, pw, ph, dpi, 8.0) {
                     Ok(r) => s.renderer = Some(r),
                     Err(err) => log_diag(&format!("PortalRenderer::new failed: {err:?}")),
                 }
-                s.restart_watcher();
                 s.register_dnd();
             }
 
@@ -235,24 +238,30 @@ impl PortalWindow {
         }
     }
 
-    fn restart_watcher(&mut self) {
-        self.watcher = None;
-        if let PortalKind::Folder { path } = &self.config.kind {
-            self.watcher = FolderWatcher::start(path.clone(), self.hwnd);
+    pub fn refresh_from_library(&mut self) {
+        self.games = self
+            .library
+            .borrow()
+            .games_for_portal(&self.config.kind, self.config.sort_by);
+        if self.games.is_empty() {
+            self.selected_index = None;
+        } else if self
+            .selected_index
+            .map(|i| i >= self.games.len())
+            .unwrap_or(true)
+        {
+            self.selected_index = Some(0);
         }
-    }
-
-    pub fn reload_items(&mut self) {
-        self.items = load_items(&self.config.kind);
         self.recompute_layout();
         self.draw();
     }
 
     fn recompute_layout(&mut self) {
-        self.layout = GridLayout::compute(
+        self.layout = GameGridLayout::compute(
             self.config.width as f32,
             self.config.expanded_height as f32,
-            self.items.len(),
+            self.games.len(),
+            self.config.show_details,
         );
         self.scroll_y = self.scroll_y.clamp(0.0, self.layout.max_scroll);
     }
@@ -272,6 +281,12 @@ impl PortalWindow {
         self.notify_config_dirty();
     }
 
+    fn set_collapsed_if_idle(&mut self) {
+        if self.config.auto_collapse && !self.mouse_inside && !self.is_drag_over {
+            self.set_collapsed(true);
+        }
+    }
+
     fn start_animation(&mut self) {
         if !self.animating {
             self.animating = true;
@@ -289,7 +304,7 @@ impl PortalWindow {
 
         let still_moving = self.height_spring.step(dt);
         let target_px = self.dip_to_px(self.height_spring.value).round().max(40.0) as i32;
-        let width_px = self.dip_to_px(self.config.width as f32).round().max(180.0) as i32;
+        let width_px = self.dip_to_px(self.config.width as f32).round().max(220.0) as i32;
 
         if !still_moving {
             self.animating = false;
@@ -315,21 +330,20 @@ impl PortalWindow {
 
     pub fn draw(&mut self) {
         let (w_dip, h_dip) = self.current_dip_size();
-        let is_virtual = matches!(self.config.kind, PortalKind::Virtual { .. });
         if let Some(renderer) = &mut self.renderer {
             let state = RenderState {
                 title: &self.config.title,
-                items: &self.items,
+                games: &self.games,
                 layout: &self.layout,
                 width: w_dip,
                 height: h_dip,
                 dpi: self.dpi,
                 scroll_y: self.scroll_y,
-                hovered_index: self.hovered_index,
+                hovered: self.hovered,
+                selected_index: self.selected_index,
                 collapsed: self.config.collapsed,
                 auto_collapse: self.config.auto_collapse,
                 is_drag_over: self.is_drag_over,
-                is_virtual,
                 theme: &self.config.theme,
             };
             let _ = renderer.render(&state);
@@ -347,27 +361,89 @@ impl PortalWindow {
         }
     }
 
-    fn handle_drop_paths(&mut self, paths: Vec<PathBuf>, move_files: bool) {
-        match &mut self.config.kind {
-            PortalKind::Folder { path } => {
-                copy_or_move_into_folder(&paths, path, move_files);
-                self.reload_items();
+    fn notify_library_updated(&self) {
+        unsafe {
+            let _ = PostMessageW(
+                Some(self.controller_hwnd),
+                WM_APP_LIBRARY_UPDATED,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
+
+    fn launch_game_at(&mut self, idx: usize) {
+        let Some(game) = self.games.get(idx).cloned() else {
+            return;
+        };
+        if game.launch_target.is_empty() {
+            if let Some(ref dir) = game.install_dir {
+                shell_open_str(self.hwnd, &dir.to_string_lossy());
             }
-            PortalKind::Virtual { items } => {
-                for p in paths {
-                    let name = p
-                        .file_stem()
-                        .or_else(|| p.file_name())
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "Shortcut".to_string());
-                    if !items.iter().any(|existing| existing.target == p) {
-                        items.push(VirtualItem { name, target: p });
+            return;
+        }
+
+        self.library.borrow_mut().record_launch(&game.id);
+        self.notify_library_updated();
+
+        let target_path = PathBuf::from(&game.launch_target);
+        if target_path.exists() && target_path.is_file() {
+            // Spawn direct executable and track exact session duration
+            let game_id = game.id.clone();
+            let ctrl_raw = self.controller_hwnd.0 as isize;
+            let library_ref = Rc::clone(&self.library);
+            let _ = library_ref; // updated on main thread via message or direct record
+            let started = Instant::now();
+            if let Ok(mut child) = std::process::Command::new(&target_path)
+                .current_dir(target_path.parent().unwrap_or(std::path::Path::new(".")))
+                .spawn()
+            {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                    let secs = started.elapsed().as_secs();
+                    if secs > 0 {
+                        let payload = Box::new((game_id, secs));
+                        unsafe {
+                            let _ = PostMessageW(
+                                Some(HWND(ctrl_raw as *mut _)),
+                                WM_APP_LIBRARY_UPDATED,
+                                WPARAM(1),
+                                LPARAM(Box::into_raw(payload) as isize),
+                            );
+                        }
                     }
-                }
-                self.reload_items();
-                self.notify_config_dirty();
+                });
+                return;
             }
         }
+
+        shell_open_str(self.hwnd, &game.launch_target);
+    }
+
+    fn handle_drop_paths(&mut self, paths: Vec<PathBuf>) {
+        let mut added_ids = Vec::new();
+        {
+            let mut lib = self.library.borrow_mut();
+            for p in paths {
+                let entry = lib.add_custom_path(p);
+                added_ids.push(entry.id);
+            }
+        }
+
+        match &mut self.config.kind {
+            PortalKind::Custom { game_ids } => {
+                for id in added_ids {
+                    if !game_ids.contains(&id) {
+                        game_ids.push(id);
+                    }
+                }
+                self.notify_config_dirty();
+            }
+            _ => {
+                // Switch dropped non-custom portal? No, custom games appear automatically in Installed.
+            }
+        }
+        self.notify_library_updated();
     }
 }
 
@@ -428,7 +504,6 @@ unsafe fn setup_dwm_attributes(hwnd: HWND) {
         &corner as *const _ as *const c_void,
         std::mem::size_of_val(&corner) as u32,
     );
-    // Remove DWM's native gray 1px border so only our D2D specular glass rim draws.
     let no_border = DWMWA_COLOR_NONE;
     let _ = DwmSetWindowAttribute(
         hwnd,
@@ -436,7 +511,6 @@ unsafe fn setup_dwm_attributes(hwnd: HWND) {
         &no_border as *const _ as *const c_void,
         std::mem::size_of_val(&no_border) as u32,
     );
-    // Prevent Aero Peek / Show Desktop hover from fading out portals.
     let yes: i32 = 1;
     let _ = DwmSetWindowAttribute(
         hwnd,
@@ -459,8 +533,8 @@ unsafe fn setup_dwm_attributes(hwnd: HWND) {
     let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
 }
 
-fn shell_open_path(owner: HWND, path: &std::path::Path) {
-    let path_w = to_wide_null(&path.to_string_lossy());
+fn shell_open_str(owner: HWND, target: &str) {
+    let path_w = to_wide_null(target);
     let verb_w = to_wide_null("open");
     unsafe {
         ShellExecuteW(
@@ -471,33 +545,6 @@ fn shell_open_path(owner: HWND, path: &std::path::Path) {
             PCWSTR::null(),
             SW_SHOWNORMAL,
         );
-    }
-}
-
-pub fn pick_folder_dialog(owner: HWND) -> Option<PathBuf> {
-    unsafe {
-        let dialog: IFileOpenDialog = windows::Win32::System::Com::CoCreateInstance(
-            &FileOpenDialog,
-            None,
-            CLSCTX_INPROC_SERVER,
-        )
-        .ok()?;
-        let opts = dialog.GetOptions().ok()?;
-        dialog.SetOptions(opts | FOS_PICKFOLDERS).ok()?;
-        if dialog.Show(Some(owner)).is_err() {
-            return None;
-        }
-        let item = dialog.GetResult().ok()?;
-        let pwstr = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
-        let path_str = pwstr.to_string().ok()?;
-        windows::Win32::System::Com::CoTaskMemFree(Some(pwstr.0 as *const c_void));
-        Some(PathBuf::from(path_str))
-    }
-}
-
-pub fn hide_window(hwnd: HWND) {
-    unsafe {
-        let _ = ShowWindow(hwnd, SW_HIDE);
     }
 }
 
@@ -513,7 +560,6 @@ unsafe extern "system" fn portal_wnd_proc(
         return LRESULT(0);
     }
 
-    // Handle WM_WINDOWPOSCHANGING before touching RefCell to prevent any re-entrant borrow panics.
     if msg == WM_WINDOWPOSCHANGING {
         let wp = &mut *(lparam.0 as *mut WINDOWPOS);
         wp.hwndInsertAfter = if is_bring_to_front() {
@@ -544,11 +590,9 @@ unsafe extern "system" fn portal_wnd_proc(
             let mut rect = RECT::default();
             let _ = GetClientRect(hwnd, &mut rect);
             let (pw, ph) = rect_size(&rect);
-            let (dpi, radius) = {
-                let p = rc_clone.borrow();
-                (p.dpi, p.config.theme.corner_radius)
-            };
             if let Ok(mut p) = rc_clone.try_borrow_mut() {
+                let dpi = p.dpi;
+                let radius = p.config.theme.corner_radius;
                 if let Some(renderer) = &mut p.renderer {
                     let _ = renderer.resize(pw, ph, dpi, radius);
                 }
@@ -635,7 +679,6 @@ unsafe extern "system" fn portal_wnd_proc(
                 None,
                 MoveWin(i32, i32),
                 ResizeWin(i32, i32),
-                StartDrag(PathBuf),
             }
 
             let lx = (lparam.0 & 0xFFFF) as i16 as i32;
@@ -692,8 +735,8 @@ unsafe extern "system" fn portal_wnd_proc(
                     } => {
                         let dx_dip = portal.px_to_dip(pt.x - start_screen_x).round() as i32;
                         let dy_dip = portal.px_to_dip(pt.y - start_screen_y).round() as i32;
-                        let new_w = (start_w + dx_dip).clamp(220, 960);
-                        let new_h = (start_h + dy_dip).clamp(160, 1080);
+                        let new_w = (start_w + dx_dip).clamp(280, 1280);
+                        let new_h = (start_h + dy_dip).clamp(240, 1080);
                         portal.config.width = new_w;
                         portal.config.expanded_height = new_h;
                         portal.height_spring.snap(new_h as f32);
@@ -702,22 +745,6 @@ unsafe extern "system" fn portal_wnd_proc(
                         let ph = portal.dip_to_px(new_h as f32).round() as i32;
                         MoveAction::ResizeWin(pw, ph)
                     }
-                    DragMode::PendingItemDrag {
-                        index,
-                        start_x,
-                        start_y,
-                    } => {
-                        if (x_dip - start_x).abs() > 6.0 || (y_dip - start_y).abs() > 6.0 {
-                            portal.drag_mode = DragMode::None;
-                            if let Some(item) = portal.items.get(index) {
-                                MoveAction::StartDrag(item.path.clone())
-                            } else {
-                                MoveAction::None
-                            }
-                        } else {
-                            MoveAction::None
-                        }
-                    }
                     DragMode::None => {
                         let new_hover = if portal.config.collapsed {
                             None
@@ -725,12 +752,12 @@ unsafe extern "system" fn portal_wnd_proc(
                             portal.layout.hit_test(
                                 x_dip,
                                 y_dip,
-                                portal.items.len(),
+                                portal.games.len(),
                                 portal.scroll_y,
                             )
                         };
-                        if new_hover != portal.hovered_index {
-                            portal.hovered_index = new_hover;
+                        if new_hover != portal.hovered {
+                            portal.hovered = new_hover;
                             portal.draw();
                         }
                         MoveAction::None
@@ -773,10 +800,6 @@ unsafe extern "system" fn portal_wnd_proc(
                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
                     );
                 }
-                MoveAction::StartDrag(path) => {
-                    let _ = ReleaseCapture();
-                    start_file_drag(&path);
-                }
                 MoveAction::None => {}
             }
             LRESULT(0)
@@ -785,8 +808,8 @@ unsafe extern "system" fn portal_wnd_proc(
             let start_collapse_timer = {
                 let mut portal = rc_clone.borrow_mut();
                 portal.mouse_inside = false;
-                if portal.hovered_index.is_some() {
-                    portal.hovered_index = None;
+                if portal.hovered.is_some() {
+                    portal.hovered = None;
                     portal.draw();
                 }
                 portal.config.auto_collapse && !portal.config.collapsed
@@ -833,18 +856,35 @@ unsafe extern "system" fn portal_wnd_proc(
                         };
                         true
                     }
-                } else if let Some(idx) =
-                    portal
-                        .layout
-                        .hit_test(x_dip, y_dip, portal.items.len(), portal.scroll_y)
-                {
-                    portal.drag_mode = DragMode::PendingItemDrag {
-                        index: idx,
-                        start_x: x_dip,
-                        start_y: y_dip,
-                    };
-                    true
                 } else {
+                    match portal
+                        .layout
+                        .hit_test(x_dip, y_dip, portal.games.len(), portal.scroll_y)
+                    {
+                        Some(HitTarget::CardPlayButton(idx)) => {
+                            portal.selected_index = Some(idx);
+                            portal.launch_game_at(idx);
+                            portal.draw();
+                        }
+                        Some(HitTarget::Card(idx)) => {
+                            portal.selected_index = Some(idx);
+                            portal.draw();
+                        }
+                        Some(HitTarget::DetailsPlayButton) => {
+                            if let Some(idx) = portal.selected_index {
+                                portal.launch_game_at(idx);
+                            }
+                        }
+                        Some(HitTarget::DetailsFavButton) => {
+                            if let Some(idx) = portal.selected_index {
+                                if let Some(game_id) = portal.games.get(idx).map(|g| g.id.clone()) {
+                                    portal.library.borrow_mut().toggle_favorite(&game_id);
+                                    portal.notify_library_updated();
+                                }
+                            }
+                        }
+                        None => {}
+                    }
                     false
                 }
             };
@@ -868,9 +908,6 @@ unsafe extern "system" fn portal_wnd_proc(
                     portal.drag_mode = DragMode::None;
                     portal.notify_config_dirty();
                 }
-                DragMode::PendingItemDrag { .. } => {
-                    portal.drag_mode = DragMode::None;
-                }
                 DragMode::None => {}
             }
             LRESULT(0)
@@ -878,43 +915,37 @@ unsafe extern "system" fn portal_wnd_proc(
         WM_LBUTTONDBLCLK => {
             let lx = (lparam.0 & 0xFFFF) as i16 as i32;
             let ly = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            let launch_path = {
-                let mut portal = rc_clone.borrow_mut();
-                let x_dip = portal.px_to_dip(lx);
-                let y_dip = portal.px_to_dip(ly);
+            let mut portal = rc_clone.borrow_mut();
+            let x_dip = portal.px_to_dip(lx);
+            let y_dip = portal.px_to_dip(ly);
 
-                if y_dip <= HEADER_HEIGHT {
-                    let next = !portal.config.collapsed;
-                    portal.set_collapsed(next);
-                    None
-                } else {
-                    portal
-                        .layout
-                        .hit_test(x_dip, y_dip, portal.items.len(), portal.scroll_y)
-                        .and_then(|idx| portal.items.get(idx).map(|it| it.path.clone()))
-                }
-            };
-            if let Some(path) = launch_path {
-                shell_open_path(hwnd, &path);
+            if y_dip <= HEADER_HEIGHT {
+                let next = !portal.config.collapsed;
+                portal.set_collapsed(next);
+            } else if let Some(HitTarget::Card(idx) | HitTarget::CardPlayButton(idx)) = portal
+                .layout
+                .hit_test(x_dip, y_dip, portal.games.len(), portal.scroll_y)
+            {
+                portal.selected_index = Some(idx);
+                portal.launch_game_at(idx);
             }
             LRESULT(0)
         }
         WM_RBUTTONUP => {
-            let (collapsed, auto_collapse, folder_path, controller_hwnd) = {
+            let (collapsed, auto_collapse, show_details, sort_by, kind, controller_hwnd) = {
                 let p = rc_clone.borrow();
-                let fp = match &p.config.kind {
-                    PortalKind::Folder { path } => Some(path.clone()),
-                    PortalKind::Virtual { .. } => None,
-                };
                 (
                     p.config.collapsed,
                     p.config.auto_collapse,
-                    fp,
+                    p.config.show_details,
+                    p.config.sort_by,
+                    p.config.kind.clone(),
                     p.controller_hwnd,
                 )
             };
 
-            let cmd = show_portal_menu(hwnd, collapsed, auto_collapse, folder_path.is_some());
+            let cmd =
+                show_portal_menu(hwnd, collapsed, auto_collapse, show_details, sort_by, &kind);
             match cmd {
                 Some(CTX_TOGGLE_COLLAPSE) => {
                     rc_clone.borrow_mut().set_collapsed(!collapsed);
@@ -925,25 +956,69 @@ unsafe extern "system" fn portal_wnd_proc(
                     p.notify_config_dirty();
                     p.draw();
                 }
-                Some(CTX_OPEN_FOLDER) => {
-                    if let Some(path) = folder_path {
-                        shell_open_path(hwnd, &path);
-                    }
+                Some(CTX_TOGGLE_DETAILS) => {
+                    let mut p = rc_clone.borrow_mut();
+                    p.config.show_details = !p.config.show_details;
+                    p.recompute_layout();
+                    p.notify_config_dirty();
+                    p.draw();
                 }
-                Some(CTX_CHANGE_FOLDER) => {
-                    if let Some(new_folder) = pick_folder_dialog(hwnd) {
-                        let mut p = rc_clone.borrow_mut();
-                        if let Some(name) = new_folder.file_name() {
-                            p.config.title = name.to_string_lossy().into_owned();
-                        }
-                        p.config.kind = PortalKind::Folder { path: new_folder };
-                        if let Some(r) = &mut p.renderer {
-                            r.clear_icon_cache();
-                        }
-                        p.restart_watcher();
-                        p.reload_items();
-                        p.notify_config_dirty();
-                    }
+                Some(CTX_SORT_LAST_PLAYED) => {
+                    let mut p = rc_clone.borrow_mut();
+                    p.config.sort_by = SortBy::LastPlayed;
+                    p.refresh_from_library();
+                    p.notify_config_dirty();
+                }
+                Some(CTX_SORT_PLAYTIME) => {
+                    let mut p = rc_clone.borrow_mut();
+                    p.config.sort_by = SortBy::Playtime;
+                    p.refresh_from_library();
+                    p.notify_config_dirty();
+                }
+                Some(CTX_SORT_NAME) => {
+                    let mut p = rc_clone.borrow_mut();
+                    p.config.sort_by = SortBy::Name;
+                    p.refresh_from_library();
+                    p.notify_config_dirty();
+                }
+                Some(CTX_KIND_RECENT) => {
+                    let mut p = rc_clone.borrow_mut();
+                    p.config.kind = PortalKind::Recent;
+                    p.config.title = "Jugados recientemente".into();
+                    p.refresh_from_library();
+                    p.notify_config_dirty();
+                }
+                Some(CTX_KIND_FAVORITES) => {
+                    let mut p = rc_clone.borrow_mut();
+                    p.config.kind = PortalKind::Favorites;
+                    p.config.title = "Favoritos".into();
+                    p.refresh_from_library();
+                    p.notify_config_dirty();
+                }
+                Some(CTX_KIND_INSTALLED) => {
+                    let mut p = rc_clone.borrow_mut();
+                    p.config.kind = PortalKind::Installed;
+                    p.config.title = "Instalados".into();
+                    p.refresh_from_library();
+                    p.notify_config_dirty();
+                }
+                Some(CTX_KIND_STEAM) => {
+                    let mut p = rc_clone.borrow_mut();
+                    p.config.kind = PortalKind::Launcher {
+                        name: "Steam".into(),
+                    };
+                    p.config.title = "Steam".into();
+                    p.refresh_from_library();
+                    p.notify_config_dirty();
+                }
+                Some(CTX_KIND_EPIC) => {
+                    let mut p = rc_clone.borrow_mut();
+                    p.config.kind = PortalKind::Launcher {
+                        name: "Epic".into(),
+                    };
+                    p.config.title = "Epic Games".into();
+                    p.refresh_from_library();
+                    p.notify_config_dirty();
                 }
                 Some(CTX_CLOSE_PORTAL) => {
                     let _ = PostMessageW(
@@ -960,17 +1035,13 @@ unsafe extern "system" fn portal_wnd_proc(
         }
         WM_MOUSEWHEEL => {
             let delta = ((wparam.0 >> 16) as i16) as f32;
-            let step = -(delta / 120.0) * 38.0;
+            let step = -(delta / 120.0) * 48.0;
             let mut portal = rc_clone.borrow_mut();
             let next = (portal.scroll_y + step).clamp(0.0, portal.layout.max_scroll);
             if (next - portal.scroll_y).abs() > 0.1 {
                 portal.scroll_y = next;
                 portal.draw();
             }
-            LRESULT(0)
-        }
-        WM_APP_FS_CHANGED => {
-            rc_clone.borrow_mut().reload_items();
             LRESULT(0)
         }
         WM_APP_DROP_PATHS => {
@@ -985,16 +1056,12 @@ unsafe extern "system" fn portal_wnd_proc(
             } else if (mode == 2 || mode == 3) && lparam.0 != 0 {
                 portal.is_drag_over = false;
                 let boxed = Box::from_raw(lparam.0 as *mut Vec<PathBuf>);
-                portal.handle_drop_paths(*boxed, mode == 3);
+                portal.handle_drop_paths(*boxed);
             }
             LRESULT(0)
         }
         WM_DESTROY => {
-            let had_dt = {
-                let mut portal = rc_clone.borrow_mut();
-                portal.watcher = None;
-                portal._drop_target.take().is_some()
-            };
+            let had_dt = rc_clone.borrow_mut()._drop_target.take().is_some();
             if had_dt {
                 let _ = RevokeDragDrop(hwnd);
             }
@@ -1004,19 +1071,13 @@ unsafe extern "system" fn portal_wnd_proc(
     }
 }
 
-impl PortalWindow {
-    fn set_collapsed_if_idle(&mut self) {
-        if self.config.auto_collapse && !self.mouse_inside && !self.is_drag_over {
-            self.set_collapsed(true);
-        }
-    }
-}
-
 unsafe fn show_portal_menu(
     hwnd: HWND,
     collapsed: bool,
     auto_collapse: bool,
-    is_folder: bool,
+    show_details: bool,
+    sort_by: SortBy,
+    kind: &PortalKind,
 ) -> Option<u32> {
     let Ok(menu) = CreatePopupMenu() else {
         return None;
@@ -1034,23 +1095,66 @@ unsafe fn show_portal_menu(
     add_item(
         CTX_TOGGLE_COLLAPSE,
         if collapsed {
-            "Expand Portal"
+            "Expandir portal"
         } else {
-            "Collapse Portal"
+            "Colapsar portal"
         },
         None,
     );
     add_item(
         CTX_TOGGLE_AUTO_COLLAPSE,
-        "Auto-Collapse on Leave",
+        "Auto-colapsar al salir",
         Some(auto_collapse),
     );
-    if is_folder {
-        add_item(CTX_OPEN_FOLDER, "Open in Explorer", None);
-        add_item(CTX_CHANGE_FOLDER, "Change Folder...", None);
-    }
+    add_item(
+        CTX_TOGGLE_DETAILS,
+        "Panel de detalles Playnite",
+        Some(show_details),
+    );
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-    add_item(CTX_CLOSE_PORTAL, "Remove Portal", None);
+    add_item(
+        CTX_SORT_LAST_PLAYED,
+        "Ordenar: Última partida",
+        Some(sort_by == SortBy::LastPlayed),
+    );
+    add_item(
+        CTX_SORT_PLAYTIME,
+        "Ordenar: Horas jugadas",
+        Some(sort_by == SortBy::Playtime),
+    );
+    add_item(
+        CTX_SORT_NAME,
+        "Ordenar: Nombre (A-Z)",
+        Some(sort_by == SortBy::Name),
+    );
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    add_item(
+        CTX_KIND_RECENT,
+        "Filtro: Recientes",
+        Some(matches!(kind, PortalKind::Recent)),
+    );
+    add_item(
+        CTX_KIND_FAVORITES,
+        "Filtro: Favoritos",
+        Some(matches!(kind, PortalKind::Favorites)),
+    );
+    add_item(
+        CTX_KIND_INSTALLED,
+        "Filtro: Instalados",
+        Some(matches!(kind, PortalKind::Installed)),
+    );
+    add_item(
+        CTX_KIND_STEAM,
+        "Filtro: Steam",
+        Some(matches!(kind, PortalKind::Launcher { name } if name.eq_ignore_ascii_case("Steam"))),
+    );
+    add_item(
+        CTX_KIND_EPIC,
+        "Filtro: Epic Games",
+        Some(matches!(kind, PortalKind::Launcher { name } if name.eq_ignore_ascii_case("Epic"))),
+    );
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    add_item(CTX_CLOSE_PORTAL, "Eliminar portal", None);
 
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
