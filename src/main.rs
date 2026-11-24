@@ -42,13 +42,15 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW,
-    PostQuitMessage, RegisterClassExW, SetWindowLongPtrW, TranslateMessage, GWLP_USERDATA,
-    HWND_MESSAGE, MSG, SW_SHOWNORMAL, WM_CREATE, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_NCDESTROY,
-    WM_RBUTTONUP, WNDCLASSEXW,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW, KillTimer,
+    PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW, TranslateMessage,
+    GWLP_USERDATA, HWND_MESSAGE, MSG, SW_SHOWNORMAL, WM_CREATE, WM_HOTKEY, WM_LBUTTONDBLCLK,
+    WM_NCDESTROY, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW,
 };
 
 const CONTROLLER_CLASS: &str = "OpenDesktopDoorsController";
+const TIMER_WIN_D_RECHECK_1: usize = 101;
+const TIMER_WIN_D_RECHECK_2: usize = 102;
 
 struct AppState {
     hwnd: HWND,
@@ -255,6 +257,21 @@ unsafe extern "system" fn controller_wnd_proc(
                 let hwnds = rc_clone.borrow().portal_hwnds();
                 for h in hwnds {
                     apply_z_order_hwnd(h);
+                }
+                // Re-pin after Explorer finishes raising WorkerW during Win+D / Show Desktop click
+                let _ = SetTimer(Some(hwnd), TIMER_WIN_D_RECHECK_1, 60, None);
+                let _ = SetTimer(Some(hwnd), TIMER_WIN_D_RECHECK_2, 180, None);
+            }
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            if wparam.0 == TIMER_WIN_D_RECHECK_1 || wparam.0 == TIMER_WIN_D_RECHECK_2 {
+                let _ = KillTimer(Some(hwnd), wparam.0);
+                if !is_bring_to_front() {
+                    let hwnds = rc_clone.borrow().portal_hwnds();
+                    for h in hwnds {
+                        apply_z_order_hwnd(h);
+                    }
                 }
             }
             LRESULT(0)

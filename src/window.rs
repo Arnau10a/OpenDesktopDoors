@@ -18,6 +18,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMSBT_TRANSIENTWINDOW,
+    DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_DISALLOW_PEEK, DWMWA_EXCLUDED_FROM_PEEK,
     DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
     DWMWCP_ROUND,
 };
@@ -191,7 +192,7 @@ impl PortalWindow {
                 return None;
             };
 
-            let (pw, ph, dpi, radius) = {
+            let (pw, ph, dpi) = {
                 let mut s = state.borrow_mut();
                 s.hwnd = hwnd;
                 s.dpi = GetDpiForWindow(hwnd) as f32;
@@ -201,7 +202,7 @@ impl PortalWindow {
                 let mut rc = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rc);
                 let (pw, ph) = rect_size(&rc);
-                (pw, ph, s.dpi, s.config.theme.corner_radius)
+                (pw, ph, s.dpi)
             };
 
             // Win32/DWM calls happen with NO RefCell borrow held to avoid re-entrancy panics.
@@ -209,7 +210,10 @@ impl PortalWindow {
 
             {
                 let mut s = state.borrow_mut();
-                match PortalRenderer::new(hwnd, pw, ph, dpi, radius) {
+                // Align card corner radius with Windows 11 DWMWCP_ROUND (8 DIPs) so Acrylic
+                // backdrop and Direct2D glass border match 1:1 with zero corner artifacts.
+                s.config.theme.corner_radius = 8.0;
+                match PortalRenderer::new(hwnd, pw, ph, dpi, 8.0) {
                     Ok(r) => s.renderer = Some(r),
                     Err(err) => log_diag(&format!("PortalRenderer::new failed: {err:?}")),
                 }
@@ -423,6 +427,28 @@ unsafe fn setup_dwm_attributes(hwnd: HWND) {
         DWMWA_WINDOW_CORNER_PREFERENCE,
         &corner as *const _ as *const c_void,
         std::mem::size_of_val(&corner) as u32,
+    );
+    // Remove DWM's native gray 1px border so only our D2D specular glass rim draws.
+    let no_border = DWMWA_COLOR_NONE;
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_BORDER_COLOR,
+        &no_border as *const _ as *const c_void,
+        std::mem::size_of_val(&no_border) as u32,
+    );
+    // Prevent Aero Peek / Show Desktop hover from fading out portals.
+    let yes: i32 = 1;
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_EXCLUDED_FROM_PEEK,
+        &yes as *const _ as *const c_void,
+        std::mem::size_of::<i32>() as u32,
+    );
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_DISALLOW_PEEK,
+        &yes as *const _ as *const c_void,
+        std::mem::size_of::<i32>() as u32,
     );
     let margins = MARGINS {
         cxLeftWidth: -1,

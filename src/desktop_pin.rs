@@ -4,7 +4,7 @@ use windows::core::{BOOL, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowExW, FindWindowW, GetClassNameW, GetShellWindow, GetWindow,
+    EnumWindows, FindWindowExW, FindWindowW, GetClassNameW, GetShellWindow, GetWindow, IsIconic,
     IsWindowVisible, PostMessageW, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
     EVENT_SYSTEM_MINIMIZESTART, GW_HWNDPREV, HWND_TOP, WINEVENT_OUTOFCONTEXT,
     WINEVENT_SKIPOWNPROCESS,
@@ -59,8 +59,7 @@ impl Drop for DesktopPinGuard {
 }
 
 /// Finds the `hWndInsertAfter` handle that places `portal_hwnd` immediately above the
-/// Windows Desktop (`WorkerW`/`Progman`) and below all normal application windows.
-/// Never returns `HWND_BOTTOM`, which would hide the window behind the wallpaper.
+/// Windows Desktop (`WorkerW`/`Progman`) and below all normal non-minimized app windows.
 pub fn desktop_insert_after(portal_hwnd: HWND) -> HWND {
     unsafe {
         let Some(desktop) = find_desktop_host_hwnd() else {
@@ -68,27 +67,40 @@ pub fn desktop_insert_after(portal_hwnd: HWND) -> HWND {
         };
 
         let mut prev = GetWindow(desktop, GW_HWNDPREV);
-        while prev.is_ok() {
-            let candidate = prev.unwrap();
-            if candidate != portal_hwnd && IsWindowVisible(candidate).as_bool() {
+        while let Ok(candidate) = prev {
+            if candidate != portal_hwnd
+                && IsWindowVisible(candidate).as_bool()
+                && !IsIconic(candidate).as_bool()
+            {
                 let cls = window_class_name(candidate);
-                if cls != "OpenDesktopDoorsPortal" && cls != "Progman" && cls != "WorkerW" {
+                if !is_shell_or_portal_class(&cls) {
                     return candidate;
                 }
             }
             prev = GetWindow(candidate, GW_HWNDPREV);
         }
 
-        // No visible app windows above the desktop (e.g. Win+D): sit right on top.
+        // No visible non-minimized app windows above desktop (e.g. Win+D / Show Desktop)
         HWND_TOP
     }
+}
+
+fn is_shell_or_portal_class(cls: &str) -> bool {
+    matches!(
+        cls,
+        "OpenDesktopDoorsPortal"
+            | "Progman"
+            | "WorkerW"
+            | "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "TopLevelWindowForOverflowXamlIsland"
+    )
 }
 
 unsafe fn find_desktop_host_hwnd() -> Option<HWND> {
     let shell_def_view = to_wide_null("SHELLDLL_DefView");
     let worker_w = to_wide_null("WorkerW");
 
-    // Check Progman first
     let progman_cls = to_wide_null("Progman");
     if let Ok(progman) = FindWindowW(PCWSTR(progman_cls.as_ptr()), PCWSTR::null()) {
         if FindWindowExW(
@@ -103,7 +115,6 @@ unsafe fn find_desktop_host_hwnd() -> Option<HWND> {
         }
     }
 
-    // Fallback: locate WorkerW hosting SHELLDLL_DefView
     let mut found: HWND = HWND::default();
     let _ = EnumWindows(
         Some(enum_worker_proc),
@@ -158,7 +169,10 @@ unsafe extern "system" fn win_event_proc(
 
     if event == EVENT_SYSTEM_FOREGROUND {
         let cls = window_class_name(hwnd);
-        if cls == "WorkerW" || cls == "Progman" {
+        if matches!(
+            cls.as_str(),
+            "WorkerW" | "Progman" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+        ) {
             let _ = PostMessageW(
                 Some(controller),
                 WM_APP_WIN_D_GUARD,

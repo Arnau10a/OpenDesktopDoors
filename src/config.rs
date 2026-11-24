@@ -32,7 +32,7 @@ impl Default for PortalTheme {
             tint_g: 0.12,
             tint_b: 0.16,
             tint_a: 0.48,
-            corner_radius: 24.0,
+            corner_radius: 8.0,
         }
     }
 }
@@ -126,7 +126,7 @@ impl Default for AppConfig {
                 tint_g: 0.14,
                 tint_b: 0.20,
                 tint_a: 0.46,
-                corner_radius: 24.0,
+                corner_radius: 8.0,
             },
         });
 
