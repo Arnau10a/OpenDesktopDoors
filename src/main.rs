@@ -27,7 +27,9 @@ use tray::{
     TrayIcon, CMD_EXIT, CMD_NEW_FOLDER_PORTAL, CMD_NEW_VIRTUAL_PORTAL, CMD_OPEN_CONFIG_DIR,
     CMD_TOGGLE_FRONT, CMD_TOGGLE_STARTUP,
 };
-use window::{is_bring_to_front, pick_folder_dialog, set_bring_to_front, PortalWindow};
+use window::{
+    apply_z_order_hwnd, is_bring_to_front, pick_folder_dialog, set_bring_to_front, PortalWindow,
+};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
@@ -68,41 +70,31 @@ impl AppState {
         let _ = config::save_config(&self.config);
     }
 
-    fn apply_all_z_order(&self) {
-        for p in &self.portals {
-            p.borrow().apply_z_order();
-        }
+    fn portal_hwnds(&self) -> Vec<HWND> {
+        self.portals.iter().map(|p| p.borrow().hwnd).collect()
     }
 
-    fn toggle_front(&mut self) {
-        let next = !is_bring_to_front();
-        set_bring_to_front(next);
-        self.apply_all_z_order();
-    }
-
-    fn spawn_new_folder_portal(&mut self) {
-        if let Some(folder) = pick_folder_dialog(self.hwnd) {
-            let title = folder
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Folder".to_string());
-            let offset = (self.portals.len() as i32) * 32;
-            let cfg = PortalConfig {
-                id: format!("portal-{}", self.portals.len() + 1),
-                title,
-                kind: PortalKind::Folder { path: folder },
-                x: 80 + offset,
-                y: 80 + offset,
-                width: 340,
-                expanded_height: 360,
-                collapsed: false,
-                auto_collapse: false,
-                theme: PortalTheme::default(),
-            };
-            if let Some(win) = PortalWindow::spawn(self.hinstance, self.hwnd, cfg) {
-                self.portals.push(win);
-                self.save_current_config();
-            }
+    fn add_folder_portal(&mut self, folder: std::path::PathBuf) {
+        let title = folder
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Folder".to_string());
+        let offset = (self.portals.len() as i32) * 32;
+        let cfg = PortalConfig {
+            id: format!("portal-{}", self.portals.len() + 1),
+            title,
+            kind: PortalKind::Folder { path: folder },
+            x: 80 + offset,
+            y: 80 + offset,
+            width: 340,
+            expanded_height: 360,
+            collapsed: false,
+            auto_collapse: false,
+            theme: PortalTheme::default(),
+        };
+        if let Some(win) = PortalWindow::spawn(self.hinstance, self.hwnd, cfg) {
+            self.portals.push(win);
+            self.save_current_config();
         }
     }
 
@@ -244,27 +236,36 @@ unsafe extern "system" fn controller_wnd_proc(
     let rc_clone = Rc::clone(&rc);
     std::mem::forget(rc);
 
-    let mut state = rc_clone.borrow_mut();
-
     match msg {
         WM_HOTKEY => {
             if wparam.0 as i32 == HOTKEY_TOGGLE_FRONT_ID {
-                state.toggle_front();
+                let hwnds = {
+                    let next = !is_bring_to_front();
+                    set_bring_to_front(next);
+                    rc_clone.borrow().portal_hwnds()
+                };
+                for h in hwnds {
+                    apply_z_order_hwnd(h);
+                }
             }
             LRESULT(0)
         }
         WM_APP_WIN_D_GUARD => {
             if !is_bring_to_front() {
-                state.apply_all_z_order();
+                let hwnds = rc_clone.borrow().portal_hwnds();
+                for h in hwnds {
+                    apply_z_order_hwnd(h);
+                }
             }
             LRESULT(0)
         }
         WM_APP_CONFIG_DIRTY => {
-            state.save_current_config();
+            rc_clone.borrow_mut().save_current_config();
             LRESULT(0)
         }
         WM_APP_PORTAL_CLOSED => {
             let closed_raw = wparam.0;
+            let mut state = rc_clone.borrow_mut();
             state
                 .portals
                 .retain(|p| p.borrow().hwnd.0 as usize != closed_raw);
@@ -274,47 +275,74 @@ unsafe extern "system" fn controller_wnd_proc(
         WM_APP_TRAY => {
             let event = (lparam.0 & 0xFFFF) as u32;
             if event == WM_LBUTTONDBLCLK {
-                state.toggle_front();
+                let hwnds = {
+                    let next = !is_bring_to_front();
+                    set_bring_to_front(next);
+                    rc_clone.borrow().portal_hwnds()
+                };
+                for h in hwnds {
+                    apply_z_order_hwnd(h);
+                }
             } else if event == WM_RBUTTONUP {
                 let startup_on = startup::is_startup_enabled();
-                let cmd = state
-                    .tray
-                    .as_ref()
-                    .and_then(|t| t.show_menu(is_bring_to_front(), startup_on));
-                if let Some(cmd_id) = cmd {
-                    match cmd_id {
-                        CMD_NEW_FOLDER_PORTAL => state.spawn_new_folder_portal(),
-                        CMD_NEW_VIRTUAL_PORTAL => state.spawn_new_virtual_portal(),
-                        CMD_TOGGLE_FRONT => state.toggle_front(),
-                        CMD_TOGGLE_STARTUP => {
-                            let _ = startup::set_startup_enabled(!startup_on);
+                let cmd = {
+                    let state = rc_clone.borrow();
+                    state
+                        .tray
+                        .as_ref()
+                        .and_then(|t| t.show_menu(is_bring_to_front(), startup_on))
+                };
+                match cmd {
+                    Some(CMD_NEW_FOLDER_PORTAL) => {
+                        if let Some(folder) = pick_folder_dialog(hwnd) {
+                            rc_clone.borrow_mut().add_folder_portal(folder);
                         }
-                        CMD_OPEN_CONFIG_DIR => {
-                            let dir = config::config_dir();
-                            let _ = std::fs::create_dir_all(&dir);
-                            let dir_w = to_wide_null(&dir.to_string_lossy());
-                            let verb = to_wide_null("open");
-                            ShellExecuteW(
-                                None,
-                                PCWSTR(verb.as_ptr()),
-                                PCWSTR(dir_w.as_ptr()),
-                                PCWSTR::null(),
-                                PCWSTR::null(),
-                                SW_SHOWNORMAL,
-                            );
-                        }
-                        CMD_EXIT => {
-                            state.save_current_config();
-                            let _ = window::hide_window;
-                            for p in &state.portals {
-                                let h = p.borrow().hwnd;
-                                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(h);
-                            }
-                            state.portals.clear();
-                            PostQuitMessage(0);
-                        }
-                        _ => {}
                     }
+                    Some(CMD_NEW_VIRTUAL_PORTAL) => {
+                        rc_clone.borrow_mut().spawn_new_virtual_portal();
+                    }
+                    Some(CMD_TOGGLE_FRONT) => {
+                        let hwnds = {
+                            let next = !is_bring_to_front();
+                            set_bring_to_front(next);
+                            rc_clone.borrow().portal_hwnds()
+                        };
+                        for h in hwnds {
+                            apply_z_order_hwnd(h);
+                        }
+                    }
+                    Some(CMD_TOGGLE_STARTUP) => {
+                        let _ = startup::set_startup_enabled(!startup_on);
+                    }
+                    Some(CMD_OPEN_CONFIG_DIR) => {
+                        let dir = config::config_dir();
+                        let _ = std::fs::create_dir_all(&dir);
+                        let dir_w = to_wide_null(&dir.to_string_lossy());
+                        let verb = to_wide_null("open");
+                        ShellExecuteW(
+                            None,
+                            PCWSTR(verb.as_ptr()),
+                            PCWSTR(dir_w.as_ptr()),
+                            PCWSTR::null(),
+                            PCWSTR::null(),
+                            SW_SHOWNORMAL,
+                        );
+                    }
+                    Some(CMD_EXIT) => {
+                        let hwnds = {
+                            let mut state = rc_clone.borrow_mut();
+                            state.save_current_config();
+                            let hs = state.portal_hwnds();
+                            state.portals.clear();
+                            hs
+                        };
+                        let _ = window::hide_window;
+                        for h in hwnds {
+                            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(h);
+                        }
+                        PostQuitMessage(0);
+                    }
+                    _ => {}
                 }
             }
             LRESULT(0)

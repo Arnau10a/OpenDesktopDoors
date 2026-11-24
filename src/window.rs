@@ -28,8 +28,6 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
-
-const WM_MOUSELEAVE: u32 = 0x02A3;
 use windows::Win32::UI::Shell::{
     FileOpenDialog, IFileOpenDialog, ShellExecuteW, FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
 };
@@ -46,6 +44,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_CLIPCHILDREN, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
+const WM_MOUSELEAVE: u32 = 0x02A3;
 const PORTAL_CLASS_NAME: &str = "OpenDesktopDoorsPortal";
 const TIMER_ANIM_ID: usize = 1;
 const TIMER_AUTO_COLLAPSE_ID: usize = 2;
@@ -188,73 +187,39 @@ impl PortalWindow {
             .ok();
 
             let Some(hwnd) = hwnd else {
-                // Reclaim leaked Rc if CreateWindowExW failed before WM_CREATE
                 let _ = Rc::from_raw(raw_ptr as *const RefCell<Self>);
                 return None;
             };
 
-            state.borrow_mut().hwnd = hwnd;
-            state.borrow_mut().setup_dwm_and_renderer();
-            state.borrow_mut().restart_watcher();
-            state.borrow_mut().register_dnd();
-            state.borrow_mut().apply_z_order();
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let (pw, ph, dpi, radius) = {
+                let mut s = state.borrow_mut();
+                s.hwnd = hwnd;
+                s.dpi = GetDpiForWindow(hwnd) as f32;
+                if s.dpi <= 0.0 {
+                    s.dpi = 96.0;
+                }
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+                let (pw, ph) = rect_size(&rc);
+                (pw, ph, s.dpi, s.config.theme.corner_radius)
+            };
+
+            // Win32/DWM calls happen with NO RefCell borrow held to avoid re-entrancy panics.
+            setup_dwm_attributes(hwnd);
+            apply_window_region(hwnd, pw as i32, ph as i32, dpi, radius);
+
+            {
+                let mut s = state.borrow_mut();
+                s.renderer = PortalRenderer::new(hwnd, pw, ph, dpi, radius).ok();
+                s.restart_watcher();
+                s.register_dnd();
+            }
+
+            apply_z_order_hwnd(hwnd);
             state.borrow_mut().draw();
         }
 
         Some(state)
-    }
-
-    unsafe fn setup_dwm_and_renderer(&mut self) {
-        self.dpi = GetDpiForWindow(self.hwnd) as f32;
-        if self.dpi <= 0.0 {
-            self.dpi = 96.0;
-        }
-
-        let dark: i32 = 1;
-        let _ = DwmSetWindowAttribute(
-            self.hwnd,
-            DWMWA_USE_IMMERSIVE_DARK_MODE,
-            &dark as *const _ as *const c_void,
-            std::mem::size_of::<i32>() as u32,
-        );
-        let backdrop = DWMSBT_TRANSIENTWINDOW;
-        let _ = DwmSetWindowAttribute(
-            self.hwnd,
-            DWMWA_SYSTEMBACKDROP_TYPE,
-            &backdrop as *const _ as *const c_void,
-            std::mem::size_of_val(&backdrop) as u32,
-        );
-        let corner = DWMWCP_ROUND;
-        let _ = DwmSetWindowAttribute(
-            self.hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            &corner as *const _ as *const c_void,
-            std::mem::size_of_val(&corner) as u32,
-        );
-        let margins = MARGINS {
-            cxLeftWidth: -1,
-            cxRightWidth: -1,
-            cyTopHeight: -1,
-            cyBottomHeight: -1,
-        };
-        let _ = DwmExtendFrameIntoClientArea(self.hwnd, &margins);
-
-        let mut rc = RECT::default();
-        let _ = GetClientRect(self.hwnd, &mut rc);
-        let (pw, ph) = rect_size(&rc);
-        self.apply_window_region(pw as i32, ph as i32);
-        self.renderer =
-            PortalRenderer::new(self.hwnd, pw, ph, self.dpi, self.config.theme.corner_radius).ok();
-    }
-
-    unsafe fn apply_window_region(&self, pw: i32, ph: i32) {
-        let radius_px = (self.config.theme.corner_radius * (self.dpi / 96.0)).round() as i32;
-        let diameter = (radius_px * 2).min(pw).min(ph).max(2);
-        let rgn = CreateRoundRectRgn(0, 0, pw + 1, ph + 1, diameter, diameter);
-        if !rgn.is_invalid() {
-            let _ = SetWindowRgn(self.hwnd, Some(rgn), false);
-        }
     }
 
     unsafe fn register_dnd(&mut self) {
@@ -286,26 +251,6 @@ impl PortalWindow {
         self.scroll_y = self.scroll_y.clamp(0.0, self.layout.max_scroll);
     }
 
-    pub fn apply_z_order(&self) {
-        unsafe {
-            let insert_after = if is_bring_to_front() {
-                HWND_TOPMOST
-            } else {
-                HWND_BOTTOM
-            };
-            let _ = SetWindowPos(
-                self.hwnd,
-                Some(insert_after),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
-            let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
-        }
-    }
-
     pub fn set_collapsed(&mut self, collapsed: bool) {
         if self.config.collapsed == collapsed {
             return;
@@ -331,7 +276,7 @@ impl PortalWindow {
         }
     }
 
-    fn step_animation(&mut self) {
+    fn compute_animation_step(&mut self) -> (i32, i32, bool) {
         let now = Instant::now();
         let dt = (now - self.last_tick).as_secs_f32();
         self.last_tick = now;
@@ -340,25 +285,10 @@ impl PortalWindow {
         let target_px = self.dip_to_px(self.height_spring.value).round().max(40.0) as i32;
         let width_px = self.dip_to_px(self.config.width as f32).round().max(180.0) as i32;
 
-        unsafe {
-            let _ = SetWindowPos(
-                self.hwnd,
-                None,
-                0,
-                0,
-                width_px,
-                target_px,
-                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-        }
-
         if !still_moving {
             self.animating = false;
-            unsafe {
-                let _ = KillTimer(Some(self.hwnd), TIMER_ANIM_ID);
-            }
         }
-        self.draw();
+        (width_px, target_px, still_moving)
     }
 
     fn dip_to_px(&self, dip: f32) -> f32 {
@@ -411,124 +341,6 @@ impl PortalWindow {
         }
     }
 
-    fn launch_item(&self, idx: usize) {
-        let Some(item) = self.items.get(idx) else {
-            return;
-        };
-        let path_w = to_wide_null(&item.path.to_string_lossy());
-        let verb_w = to_wide_null("open");
-        unsafe {
-            ShellExecuteW(
-                Some(self.hwnd),
-                PCWSTR(verb_w.as_ptr()),
-                PCWSTR(path_w.as_ptr()),
-                PCWSTR::null(),
-                PCWSTR::null(),
-                SW_SHOWNORMAL,
-            );
-        }
-    }
-
-    fn open_portal_context_menu(&mut self) {
-        unsafe {
-            let Ok(menu) = CreatePopupMenu() else {
-                return;
-            };
-            let add_item = |id: u32, text: &str, checked: Option<bool>| {
-                let w = to_wide_null(text);
-                let flags = match checked {
-                    Some(true) => MF_STRING | MF_CHECKED,
-                    Some(false) => MF_STRING | MF_UNCHECKED,
-                    None => MF_STRING,
-                };
-                let _ = AppendMenuW(menu, flags, id as usize, PCWSTR(w.as_ptr()));
-            };
-
-            add_item(
-                CTX_TOGGLE_COLLAPSE,
-                if self.config.collapsed {
-                    "Expand Portal"
-                } else {
-                    "Collapse Portal"
-                },
-                None,
-            );
-            add_item(
-                CTX_TOGGLE_AUTO_COLLAPSE,
-                "Auto-Collapse on Leave",
-                Some(self.config.auto_collapse),
-            );
-            if matches!(self.config.kind, PortalKind::Folder { .. }) {
-                add_item(CTX_OPEN_FOLDER, "Open in Explorer", None);
-                add_item(CTX_CHANGE_FOLDER, "Change Folder...", None);
-            }
-            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-            add_item(CTX_CLOSE_PORTAL, "Remove Portal", None);
-
-            let mut pt = POINT::default();
-            let _ = GetCursorPos(&mut pt);
-            let cmd = TrackPopupMenu(
-                menu,
-                TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD,
-                pt.x,
-                pt.y,
-                None,
-                self.hwnd,
-                None,
-            );
-            let _ = DestroyMenu(menu);
-
-            match cmd.0 as u32 {
-                CTX_TOGGLE_COLLAPSE => {
-                    self.set_collapsed(!self.config.collapsed);
-                }
-                CTX_TOGGLE_AUTO_COLLAPSE => {
-                    self.config.auto_collapse = !self.config.auto_collapse;
-                    self.notify_config_dirty();
-                    self.draw();
-                }
-                CTX_OPEN_FOLDER => {
-                    if let PortalKind::Folder { path } = &self.config.kind {
-                        let p = to_wide_null(&path.to_string_lossy());
-                        let verb = to_wide_null("open");
-                        ShellExecuteW(
-                            Some(self.hwnd),
-                            PCWSTR(verb.as_ptr()),
-                            PCWSTR(p.as_ptr()),
-                            PCWSTR::null(),
-                            PCWSTR::null(),
-                            SW_SHOWNORMAL,
-                        );
-                    }
-                }
-                CTX_CHANGE_FOLDER => {
-                    if let Some(new_folder) = pick_folder_dialog(self.hwnd) {
-                        if let Some(name) = new_folder.file_name() {
-                            self.config.title = name.to_string_lossy().into_owned();
-                        }
-                        self.config.kind = PortalKind::Folder { path: new_folder };
-                        if let Some(r) = &mut self.renderer {
-                            r.clear_icon_cache();
-                        }
-                        self.restart_watcher();
-                        self.reload_items();
-                        self.notify_config_dirty();
-                    }
-                }
-                CTX_CLOSE_PORTAL => {
-                    let _ = PostMessageW(
-                        Some(self.controller_hwnd),
-                        WM_APP_PORTAL_CLOSED,
-                        WPARAM(self.hwnd.0 as usize),
-                        LPARAM(0),
-                    );
-                    let _ = DestroyWindow(self.hwnd);
-                }
-                _ => {}
-            }
-        }
-    }
-
     fn handle_drop_paths(&mut self, paths: Vec<PathBuf>, move_files: bool) {
         match &mut self.config.kind {
             PortalKind::Folder { path } => {
@@ -550,6 +362,81 @@ impl PortalWindow {
                 self.notify_config_dirty();
             }
         }
+    }
+}
+
+pub fn apply_z_order_hwnd(hwnd: HWND) {
+    unsafe {
+        let insert_after = if is_bring_to_front() {
+            HWND_TOPMOST
+        } else {
+            HWND_BOTTOM
+        };
+        let _ = SetWindowPos(
+            hwnd,
+            Some(insert_after),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+}
+
+unsafe fn setup_dwm_attributes(hwnd: HWND) {
+    let dark: i32 = 1;
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &dark as *const _ as *const c_void,
+        std::mem::size_of::<i32>() as u32,
+    );
+    let backdrop = DWMSBT_TRANSIENTWINDOW;
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_SYSTEMBACKDROP_TYPE,
+        &backdrop as *const _ as *const c_void,
+        std::mem::size_of_val(&backdrop) as u32,
+    );
+    let corner = DWMWCP_ROUND;
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_WINDOW_CORNER_PREFERENCE,
+        &corner as *const _ as *const c_void,
+        std::mem::size_of_val(&corner) as u32,
+    );
+    let margins = MARGINS {
+        cxLeftWidth: -1,
+        cxRightWidth: -1,
+        cyTopHeight: -1,
+        cyBottomHeight: -1,
+    };
+    let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+}
+
+unsafe fn apply_window_region(hwnd: HWND, pw: i32, ph: i32, dpi: f32, corner_radius: f32) {
+    let radius_px = (corner_radius * (dpi / 96.0)).round() as i32;
+    let diameter = (radius_px * 2).min(pw).min(ph).max(2);
+    let rgn = CreateRoundRectRgn(0, 0, pw + 1, ph + 1, diameter, diameter);
+    if !rgn.is_invalid() {
+        let _ = SetWindowRgn(hwnd, Some(rgn), false);
+    }
+}
+
+fn shell_open_path(owner: HWND, path: &std::path::Path) {
+    let path_w = to_wide_null(&path.to_string_lossy());
+    let verb_w = to_wide_null("open");
+    unsafe {
+        ShellExecuteW(
+            Some(owner),
+            PCWSTR(verb_w.as_ptr()),
+            PCWSTR(path_w.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
     }
 }
 
@@ -592,6 +479,17 @@ unsafe extern "system" fn portal_wnd_proc(
         return LRESULT(0);
     }
 
+    // Handle WM_WINDOWPOSCHANGING before touching RefCell to prevent any re-entrant borrow panics.
+    if msg == WM_WINDOWPOSCHANGING {
+        let wp = &mut *(lparam.0 as *mut WINDOWPOS);
+        wp.hwndInsertAfter = if is_bring_to_front() {
+            HWND_TOPMOST
+        } else {
+            HWND_BOTTOM
+        };
+        return LRESULT(0);
+    }
+
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<PortalWindow>;
     if ptr.is_null() {
         return DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -607,34 +505,29 @@ unsafe extern "system" fn portal_wnd_proc(
     let rc_clone = Rc::clone(&rc);
     std::mem::forget(rc);
 
-    let mut portal = rc_clone.borrow_mut();
-
     match msg {
-        WM_WINDOWPOSCHANGING => {
-            let wp = &mut *(lparam.0 as *mut WINDOWPOS);
-            if !is_bring_to_front() {
-                wp.hwndInsertAfter = HWND_BOTTOM;
-            } else {
-                wp.hwndInsertAfter = HWND_TOPMOST;
-            }
-            LRESULT(0)
-        }
         WM_SIZE => {
             let mut rect = RECT::default();
             let _ = GetClientRect(hwnd, &mut rect);
             let (pw, ph) = rect_size(&rect);
-            portal.apply_window_region(pw as i32, ph as i32);
-            let dpi = portal.dpi;
-            let radius = portal.config.theme.corner_radius;
-            if let Some(renderer) = &mut portal.renderer {
-                let _ = renderer.resize(pw, ph, dpi, radius);
+            let (dpi, radius) = {
+                let p = rc_clone.borrow();
+                (p.dpi, p.config.theme.corner_radius)
+            };
+            apply_window_region(hwnd, pw as i32, ph as i32, dpi, radius);
+            if let Ok(mut p) = rc_clone.try_borrow_mut() {
+                if let Some(renderer) = &mut p.renderer {
+                    let _ = renderer.resize(pw, ph, dpi, radius);
+                }
+                p.draw();
             }
-            portal.draw();
             LRESULT(0)
         }
         WM_DPICHANGED => {
             let new_dpi = (wparam.0 & 0xFFFF) as f32;
-            portal.dpi = if new_dpi > 0.0 { new_dpi } else { 96.0 };
+            if let Ok(mut p) = rc_clone.try_borrow_mut() {
+                p.dpi = if new_dpi > 0.0 { new_dpi } else { 96.0 };
+            }
             let suggested = &*(lparam.0 as *const RECT);
             let _ = SetWindowPos(
                 hwnd,
@@ -645,24 +538,42 @@ unsafe extern "system" fn portal_wnd_proc(
                 suggested.bottom - suggested.top,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
-            portal.draw();
+            if let Ok(mut p) = rc_clone.try_borrow_mut() {
+                p.draw();
+            }
             LRESULT(0)
         }
         WM_PAINT => {
             let mut ps = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
             let _ = windows::Win32::Graphics::Gdi::BeginPaint(hwnd, &mut ps);
-            portal.draw();
+            if let Ok(mut p) = rc_clone.try_borrow_mut() {
+                p.draw();
+            }
             let _ = windows::Win32::Graphics::Gdi::EndPaint(hwnd, &ps);
             LRESULT(0)
         }
         WM_TIMER => {
             if wparam.0 == TIMER_ANIM_ID {
-                portal.step_animation();
+                let (width_px, target_px, still_moving) =
+                    rc_clone.borrow_mut().compute_animation_step();
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    width_px,
+                    target_px,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                if !still_moving {
+                    let _ = KillTimer(Some(hwnd), TIMER_ANIM_ID);
+                }
+                if let Ok(mut p) = rc_clone.try_borrow_mut() {
+                    p.draw();
+                }
             } else if wparam.0 == TIMER_AUTO_COLLAPSE_ID {
                 let _ = KillTimer(Some(hwnd), TIMER_AUTO_COLLAPSE_ID);
-                if portal.config.auto_collapse && !portal.mouse_inside && !portal.is_drag_over {
-                    portal.set_collapsed(true);
-                }
+                rc_clone.borrow_mut().set_collapsed_if_idle();
             }
             LRESULT(0)
         }
@@ -671,10 +582,14 @@ unsafe extern "system" fn portal_wnd_proc(
             let _ = GetCursorPos(&mut pt);
             let mut win_rc = RECT::default();
             let _ = GetWindowRect(hwnd, &mut win_rc);
-            let x_dip = portal.px_to_dip(pt.x - win_rc.left);
-            let y_dip = portal.px_to_dip(pt.y - win_rc.top);
-            let (w_dip, h_dip) = portal.current_dip_size();
-            if !portal.config.collapsed && x_dip >= w_dip - 18.0 && y_dip >= h_dip - 18.0 {
+            let is_resize = {
+                let p = rc_clone.borrow();
+                let x_dip = p.px_to_dip(pt.x - win_rc.left);
+                let y_dip = p.px_to_dip(pt.y - win_rc.top);
+                let (w_dip, h_dip) = p.current_dip_size();
+                !p.config.collapsed && x_dip >= w_dip - 18.0 && y_dip >= h_dip - 18.0
+            };
+            if is_resize {
                 if let Ok(cur) = LoadCursorW(None, IDC_SIZENWSE) {
                     windows::Win32::UI::WindowsAndMessaging::SetCursor(Some(cur));
                     return LRESULT(1);
@@ -683,8 +598,115 @@ unsafe extern "system" fn portal_wnd_proc(
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_MOUSEMOVE => {
-            if !portal.mouse_inside {
-                portal.mouse_inside = true;
+            enum MoveAction {
+                None,
+                MoveWin(i32, i32),
+                ResizeWin(i32, i32),
+                StartDrag(PathBuf),
+            }
+
+            let lx = (lparam.0 & 0xFFFF) as i16 as i32;
+            let ly = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+
+            let (need_track, action) = {
+                let mut portal = rc_clone.borrow_mut();
+                let mut track = false;
+                if !portal.mouse_inside {
+                    portal.mouse_inside = true;
+                    track = true;
+                    if portal.config.auto_collapse && portal.config.collapsed {
+                        portal.set_collapsed(false);
+                    }
+                }
+
+                let x_dip = portal.px_to_dip(lx);
+                let y_dip = portal.px_to_dip(ly);
+
+                let act = match portal.drag_mode {
+                    DragMode::MoveWindow {
+                        start_screen_x,
+                        start_screen_y,
+                        win_x,
+                        win_y,
+                        moved: _,
+                    } => {
+                        let dx = pt.x - start_screen_x;
+                        let dy = pt.y - start_screen_y;
+                        if dx.abs() > 3 || dy.abs() > 3 {
+                            portal.drag_mode = DragMode::MoveWindow {
+                                start_screen_x,
+                                start_screen_y,
+                                win_x,
+                                win_y,
+                                moved: true,
+                            };
+                            let nx = win_x + dx;
+                            let ny = win_y + dy;
+                            portal.config.x = nx;
+                            portal.config.y = ny;
+                            MoveAction::MoveWin(nx, ny)
+                        } else {
+                            MoveAction::None
+                        }
+                    }
+                    DragMode::ResizeWindow {
+                        start_screen_x,
+                        start_screen_y,
+                        start_w,
+                        start_h,
+                    } => {
+                        let dx_dip = portal.px_to_dip(pt.x - start_screen_x).round() as i32;
+                        let dy_dip = portal.px_to_dip(pt.y - start_screen_y).round() as i32;
+                        let new_w = (start_w + dx_dip).clamp(220, 960);
+                        let new_h = (start_h + dy_dip).clamp(160, 1080);
+                        portal.config.width = new_w;
+                        portal.config.expanded_height = new_h;
+                        portal.height_spring.snap(new_h as f32);
+                        portal.recompute_layout();
+                        let pw = portal.dip_to_px(new_w as f32).round() as i32;
+                        let ph = portal.dip_to_px(new_h as f32).round() as i32;
+                        MoveAction::ResizeWin(pw, ph)
+                    }
+                    DragMode::PendingItemDrag {
+                        index,
+                        start_x,
+                        start_y,
+                    } => {
+                        if (x_dip - start_x).abs() > 6.0 || (y_dip - start_y).abs() > 6.0 {
+                            portal.drag_mode = DragMode::None;
+                            if let Some(item) = portal.items.get(index) {
+                                MoveAction::StartDrag(item.path.clone())
+                            } else {
+                                MoveAction::None
+                            }
+                        } else {
+                            MoveAction::None
+                        }
+                    }
+                    DragMode::None => {
+                        let new_hover = if portal.config.collapsed {
+                            None
+                        } else {
+                            portal.layout.hit_test(
+                                x_dip,
+                                y_dip,
+                                portal.items.len(),
+                                portal.scroll_y,
+                            )
+                        };
+                        if new_hover != portal.hovered_index {
+                            portal.hovered_index = new_hover;
+                            portal.draw();
+                        }
+                        MoveAction::None
+                    }
+                };
+                (track, act)
+            };
+
+            if need_track {
                 let _ = KillTimer(Some(hwnd), TIMER_AUTO_COLLAPSE_ID);
                 let mut tme = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -693,70 +715,21 @@ unsafe extern "system" fn portal_wnd_proc(
                     dwHoverTime: 0,
                 };
                 let _ = TrackMouseEvent(&mut tme);
-                if portal.config.auto_collapse && portal.config.collapsed {
-                    portal.set_collapsed(false);
-                }
             }
 
-            let lx = (lparam.0 & 0xFFFF) as i16 as i32;
-            let ly = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            let x_dip = portal.px_to_dip(lx);
-            let y_dip = portal.px_to_dip(ly);
-
-            match portal.drag_mode {
-                DragMode::MoveWindow {
-                    start_screen_x,
-                    start_screen_y,
-                    win_x,
-                    win_y,
-                    moved: _,
-                } => {
-                    let mut pt = POINT::default();
-                    let _ = GetCursorPos(&mut pt);
-                    let dx = pt.x - start_screen_x;
-                    let dy = pt.y - start_screen_y;
-                    if dx.abs() > 3 || dy.abs() > 3 {
-                        portal.drag_mode = DragMode::MoveWindow {
-                            start_screen_x,
-                            start_screen_y,
-                            win_x,
-                            win_y,
-                            moved: true,
-                        };
-                        let nx = win_x + dx;
-                        let ny = win_y + dy;
-                        portal.config.x = nx;
-                        portal.config.y = ny;
-                        let _ = SetWindowPos(
-                            hwnd,
-                            None,
-                            nx,
-                            ny,
-                            0,
-                            0,
-                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                        );
-                    }
-                    return LRESULT(0);
+            match action {
+                MoveAction::MoveWin(nx, ny) => {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        None,
+                        nx,
+                        ny,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
                 }
-                DragMode::ResizeWindow {
-                    start_screen_x,
-                    start_screen_y,
-                    start_w,
-                    start_h,
-                } => {
-                    let mut pt = POINT::default();
-                    let _ = GetCursorPos(&mut pt);
-                    let dx_dip = portal.px_to_dip(pt.x - start_screen_x).round() as i32;
-                    let dy_dip = portal.px_to_dip(pt.y - start_screen_y).round() as i32;
-                    let new_w = (start_w + dx_dip).clamp(220, 960);
-                    let new_h = (start_h + dy_dip).clamp(160, 1080);
-                    portal.config.width = new_w;
-                    portal.config.expanded_height = new_h;
-                    portal.height_spring.snap(new_h as f32);
-                    portal.recompute_layout();
-                    let pw = portal.dip_to_px(new_w as f32).round() as i32;
-                    let ph = portal.dip_to_px(new_h as f32).round() as i32;
+                MoveAction::ResizeWin(pw, ph) => {
                     let _ = SetWindowPos(
                         hwnd,
                         None,
@@ -766,47 +739,26 @@ unsafe extern "system" fn portal_wnd_proc(
                         ph,
                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
                     );
-                    return LRESULT(0);
                 }
-                DragMode::PendingItemDrag {
-                    index,
-                    start_x,
-                    start_y,
-                } => {
-                    if (x_dip - start_x).abs() > 6.0 || (y_dip - start_y).abs() > 6.0 {
-                        portal.drag_mode = DragMode::None;
-                        let _ = ReleaseCapture();
-                        if let Some(item) = portal.items.get(index) {
-                            let path = item.path.clone();
-                            drop(portal);
-                            start_file_drag(&path);
-                        }
-                        return LRESULT(0);
-                    }
+                MoveAction::StartDrag(path) => {
+                    let _ = ReleaseCapture();
+                    start_file_drag(&path);
                 }
-                DragMode::None => {}
-            }
-
-            let new_hover = if portal.config.collapsed {
-                None
-            } else {
-                portal
-                    .layout
-                    .hit_test(x_dip, y_dip, portal.items.len(), portal.scroll_y)
-            };
-            if new_hover != portal.hovered_index {
-                portal.hovered_index = new_hover;
-                portal.draw();
+                MoveAction::None => {}
             }
             LRESULT(0)
         }
         WM_MOUSELEAVE => {
-            portal.mouse_inside = false;
-            if portal.hovered_index.is_some() {
-                portal.hovered_index = None;
-                portal.draw();
-            }
-            if portal.config.auto_collapse && !portal.config.collapsed {
+            let start_collapse_timer = {
+                let mut portal = rc_clone.borrow_mut();
+                portal.mouse_inside = false;
+                if portal.hovered_index.is_some() {
+                    portal.hovered_index = None;
+                    portal.draw();
+                }
+                portal.config.auto_collapse && !portal.config.collapsed
+            };
+            if start_collapse_timer {
                 SetTimer(Some(hwnd), TIMER_AUTO_COLLAPSE_ID, 550, None);
             }
             LRESULT(0)
@@ -814,61 +766,64 @@ unsafe extern "system" fn portal_wnd_proc(
         WM_LBUTTONDOWN => {
             let lx = (lparam.0 & 0xFFFF) as i16 as i32;
             let ly = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            let x_dip = portal.px_to_dip(lx);
-            let y_dip = portal.px_to_dip(ly);
-            let (w_dip, h_dip) = portal.current_dip_size();
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let mut win_rc = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut win_rc);
 
-            if !portal.config.collapsed && x_dip >= w_dip - 18.0 && y_dip >= h_dip - 18.0 {
-                let mut pt = POINT::default();
-                let _ = GetCursorPos(&mut pt);
-                portal.drag_mode = DragMode::ResizeWindow {
-                    start_screen_x: pt.x,
-                    start_screen_y: pt.y,
-                    start_w: portal.config.width,
-                    start_h: portal.config.expanded_height,
-                };
-                SetCapture(hwnd);
-                return LRESULT(0);
-            }
+            let capture = {
+                let mut portal = rc_clone.borrow_mut();
+                let x_dip = portal.px_to_dip(lx);
+                let y_dip = portal.px_to_dip(ly);
+                let (w_dip, h_dip) = portal.current_dip_size();
 
-            if y_dip <= HEADER_HEIGHT {
-                // Click on chevron area toggles collapse immediately
-                if x_dip >= w_dip - 42.0 {
-                    let next = !portal.config.collapsed;
-                    portal.set_collapsed(next);
-                    return LRESULT(0);
+                if !portal.config.collapsed && x_dip >= w_dip - 18.0 && y_dip >= h_dip - 18.0 {
+                    portal.drag_mode = DragMode::ResizeWindow {
+                        start_screen_x: pt.x,
+                        start_screen_y: pt.y,
+                        start_w: portal.config.width,
+                        start_h: portal.config.expanded_height,
+                    };
+                    true
+                } else if y_dip <= HEADER_HEIGHT {
+                    if x_dip >= w_dip - 42.0 {
+                        let next = !portal.config.collapsed;
+                        portal.set_collapsed(next);
+                        false
+                    } else {
+                        portal.drag_mode = DragMode::MoveWindow {
+                            start_screen_x: pt.x,
+                            start_screen_y: pt.y,
+                            win_x: win_rc.left,
+                            win_y: win_rc.top,
+                            moved: false,
+                        };
+                        true
+                    }
+                } else if let Some(idx) =
+                    portal
+                        .layout
+                        .hit_test(x_dip, y_dip, portal.items.len(), portal.scroll_y)
+                {
+                    portal.drag_mode = DragMode::PendingItemDrag {
+                        index: idx,
+                        start_x: x_dip,
+                        start_y: y_dip,
+                    };
+                    true
+                } else {
+                    false
                 }
-                let mut pt = POINT::default();
-                let _ = GetCursorPos(&mut pt);
-                let mut win_rc = RECT::default();
-                let _ = GetWindowRect(hwnd, &mut win_rc);
-                portal.drag_mode = DragMode::MoveWindow {
-                    start_screen_x: pt.x,
-                    start_screen_y: pt.y,
-                    win_x: win_rc.left,
-                    win_y: win_rc.top,
-                    moved: false,
-                };
-                SetCapture(hwnd);
-                return LRESULT(0);
-            }
+            };
 
-            if let Some(idx) =
-                portal
-                    .layout
-                    .hit_test(x_dip, y_dip, portal.items.len(), portal.scroll_y)
-            {
-                portal.drag_mode = DragMode::PendingItemDrag {
-                    index: idx,
-                    start_x: x_dip,
-                    start_y: y_dip,
-                };
+            if capture {
                 SetCapture(hwnd);
             }
             LRESULT(0)
         }
         WM_LBUTTONUP => {
             let _ = ReleaseCapture();
+            let mut portal = rc_clone.borrow_mut();
             match portal.drag_mode {
                 DragMode::MoveWindow { moved, .. } => {
                     portal.drag_mode = DragMode::None;
@@ -890,28 +845,90 @@ unsafe extern "system" fn portal_wnd_proc(
         WM_LBUTTONDBLCLK => {
             let lx = (lparam.0 & 0xFFFF) as i16 as i32;
             let ly = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            let x_dip = portal.px_to_dip(lx);
-            let y_dip = portal.px_to_dip(ly);
+            let launch_path = {
+                let mut portal = rc_clone.borrow_mut();
+                let x_dip = portal.px_to_dip(lx);
+                let y_dip = portal.px_to_dip(ly);
 
-            if y_dip <= HEADER_HEIGHT {
-                let next = !portal.config.collapsed;
-                portal.set_collapsed(next);
-            } else if let Some(idx) =
-                portal
-                    .layout
-                    .hit_test(x_dip, y_dip, portal.items.len(), portal.scroll_y)
-            {
-                portal.launch_item(idx);
+                if y_dip <= HEADER_HEIGHT {
+                    let next = !portal.config.collapsed;
+                    portal.set_collapsed(next);
+                    None
+                } else {
+                    portal
+                        .layout
+                        .hit_test(x_dip, y_dip, portal.items.len(), portal.scroll_y)
+                        .and_then(|idx| portal.items.get(idx).map(|it| it.path.clone()))
+                }
+            };
+            if let Some(path) = launch_path {
+                shell_open_path(hwnd, &path);
             }
             LRESULT(0)
         }
         WM_RBUTTONUP => {
-            portal.open_portal_context_menu();
+            let (collapsed, auto_collapse, folder_path, controller_hwnd) = {
+                let p = rc_clone.borrow();
+                let fp = match &p.config.kind {
+                    PortalKind::Folder { path } => Some(path.clone()),
+                    PortalKind::Virtual { .. } => None,
+                };
+                (
+                    p.config.collapsed,
+                    p.config.auto_collapse,
+                    fp,
+                    p.controller_hwnd,
+                )
+            };
+
+            let cmd = show_portal_menu(hwnd, collapsed, auto_collapse, folder_path.is_some());
+            match cmd {
+                Some(CTX_TOGGLE_COLLAPSE) => {
+                    rc_clone.borrow_mut().set_collapsed(!collapsed);
+                }
+                Some(CTX_TOGGLE_AUTO_COLLAPSE) => {
+                    let mut p = rc_clone.borrow_mut();
+                    p.config.auto_collapse = !p.config.auto_collapse;
+                    p.notify_config_dirty();
+                    p.draw();
+                }
+                Some(CTX_OPEN_FOLDER) => {
+                    if let Some(path) = folder_path {
+                        shell_open_path(hwnd, &path);
+                    }
+                }
+                Some(CTX_CHANGE_FOLDER) => {
+                    if let Some(new_folder) = pick_folder_dialog(hwnd) {
+                        let mut p = rc_clone.borrow_mut();
+                        if let Some(name) = new_folder.file_name() {
+                            p.config.title = name.to_string_lossy().into_owned();
+                        }
+                        p.config.kind = PortalKind::Folder { path: new_folder };
+                        if let Some(r) = &mut p.renderer {
+                            r.clear_icon_cache();
+                        }
+                        p.restart_watcher();
+                        p.reload_items();
+                        p.notify_config_dirty();
+                    }
+                }
+                Some(CTX_CLOSE_PORTAL) => {
+                    let _ = PostMessageW(
+                        Some(controller_hwnd),
+                        WM_APP_PORTAL_CLOSED,
+                        WPARAM(hwnd.0 as usize),
+                        LPARAM(0),
+                    );
+                    let _ = DestroyWindow(hwnd);
+                }
+                _ => {}
+            }
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
             let delta = ((wparam.0 >> 16) as i16) as f32;
             let step = -(delta / 120.0) * 38.0;
+            let mut portal = rc_clone.borrow_mut();
             let next = (portal.scroll_y + step).clamp(0.0, portal.layout.max_scroll);
             if (next - portal.scroll_y).abs() > 0.1 {
                 portal.scroll_y = next;
@@ -920,11 +937,12 @@ unsafe extern "system" fn portal_wnd_proc(
             LRESULT(0)
         }
         WM_APP_FS_CHANGED => {
-            portal.reload_items();
+            rc_clone.borrow_mut().reload_items();
             LRESULT(0)
         }
         WM_APP_DROP_PATHS => {
             let mode = wparam.0;
+            let mut portal = rc_clone.borrow_mut();
             if mode == 0 || mode == 1 {
                 portal.is_drag_over = mode == 1;
                 if portal.is_drag_over && portal.config.collapsed {
@@ -939,13 +957,83 @@ unsafe extern "system" fn portal_wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
-            portal.watcher = None;
-            if portal._drop_target.is_some() {
+            let had_dt = {
+                let mut portal = rc_clone.borrow_mut();
+                portal.watcher = None;
+                portal._drop_target.take().is_some()
+            };
+            if had_dt {
                 let _ = RevokeDragDrop(hwnd);
-                portal._drop_target = None;
             }
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+impl PortalWindow {
+    fn set_collapsed_if_idle(&mut self) {
+        if self.config.auto_collapse && !self.mouse_inside && !self.is_drag_over {
+            self.set_collapsed(true);
+        }
+    }
+}
+
+unsafe fn show_portal_menu(
+    hwnd: HWND,
+    collapsed: bool,
+    auto_collapse: bool,
+    is_folder: bool,
+) -> Option<u32> {
+    let Ok(menu) = CreatePopupMenu() else {
+        return None;
+    };
+    let add_item = |id: u32, text: &str, checked: Option<bool>| {
+        let w = to_wide_null(text);
+        let flags = match checked {
+            Some(true) => MF_STRING | MF_CHECKED,
+            Some(false) => MF_STRING | MF_UNCHECKED,
+            None => MF_STRING,
+        };
+        let _ = AppendMenuW(menu, flags, id as usize, PCWSTR(w.as_ptr()));
+    };
+
+    add_item(
+        CTX_TOGGLE_COLLAPSE,
+        if collapsed {
+            "Expand Portal"
+        } else {
+            "Collapse Portal"
+        },
+        None,
+    );
+    add_item(
+        CTX_TOGGLE_AUTO_COLLAPSE,
+        "Auto-Collapse on Leave",
+        Some(auto_collapse),
+    );
+    if is_folder {
+        add_item(CTX_OPEN_FOLDER, "Open in Explorer", None);
+        add_item(CTX_CHANGE_FOLDER, "Change Folder...", None);
+    }
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    add_item(CTX_CLOSE_PORTAL, "Remove Portal", None);
+
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    let cmd = TrackPopupMenu(
+        menu,
+        TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD,
+        pt.x,
+        pt.y,
+        None,
+        hwnd,
+        None,
+    );
+    let _ = DestroyMenu(menu);
+    if cmd.0 > 0 {
+        Some(cmd.0 as u32)
+    } else {
+        None
     }
 }
